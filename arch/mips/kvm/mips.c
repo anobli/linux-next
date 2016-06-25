@@ -56,6 +56,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "flush_dcache", VCPU_STAT(flush_dcache_exits), KVM_STAT_VCPU },
 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), KVM_STAT_VCPU },
 	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll), KVM_STAT_VCPU },
+	{ "halt_poll_invalid", VCPU_STAT(halt_poll_invalid), KVM_STAT_VCPU },
 	{ "halt_wakeup",  VCPU_STAT(halt_wakeup),	 KVM_STAT_VCPU },
 	{NULL}
 };
@@ -445,8 +446,8 @@ int kvm_vcpu_ioctl_interrupt(struct kvm_vcpu *vcpu,
 
 	dvcpu->arch.wait = 0;
 
-	if (waitqueue_active(&dvcpu->wq))
-		wake_up_interruptible(&dvcpu->wq);
+	if (swait_active(&dvcpu->wq))
+		swake_up(&dvcpu->wq);
 
 	return 0;
 }
@@ -702,7 +703,7 @@ static int kvm_mips_get_reg(struct kvm_vcpu *vcpu,
 	} else if ((reg->id & KVM_REG_SIZE_MASK) == KVM_REG_SIZE_U128) {
 		void __user *uaddr = (void __user *)(long)reg->addr;
 
-		return copy_to_user(uaddr, vs, 16);
+		return copy_to_user(uaddr, vs, 16) ? -EFAULT : 0;
 	} else {
 		return -EINVAL;
 	}
@@ -732,7 +733,7 @@ static int kvm_mips_set_reg(struct kvm_vcpu *vcpu,
 	} else if ((reg->id & KVM_REG_SIZE_MASK) == KVM_REG_SIZE_U128) {
 		void __user *uaddr = (void __user *)(long)reg->addr;
 
-		return copy_from_user(vs, uaddr, 16);
+		return copy_from_user(vs, uaddr, 16) ? -EFAULT : 0;
 	} else {
 		return -EINVAL;
 	}
@@ -1079,7 +1080,8 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		r = KVM_COALESCED_MMIO_PAGE_OFFSET;
 		break;
 	case KVM_CAP_MIPS_FPU:
-		r = !!cpu_has_fpu;
+		/* We don't handle systems with inconsistent cpu_has_fpu */
+		r = !!raw_cpu_has_fpu;
 		break;
 	case KVM_CAP_MIPS_MSA:
 		/*
@@ -1174,8 +1176,8 @@ static void kvm_mips_comparecount_func(unsigned long data)
 	kvm_mips_callbacks->queue_timer_int(vcpu);
 
 	vcpu->arch.wait = 0;
-	if (waitqueue_active(&vcpu->wq))
-		wake_up_interruptible(&vcpu->wq);
+	if (swait_active(&vcpu->wq))
+		swake_up(&vcpu->wq);
 }
 
 /* low level hrtimer wake routine */
@@ -1555,8 +1557,10 @@ void kvm_lose_fpu(struct kvm_vcpu *vcpu)
 
 		/* Disable MSA & FPU */
 		disable_msa();
-		if (vcpu->arch.fpu_inuse & KVM_MIPS_FPU_FPU)
+		if (vcpu->arch.fpu_inuse & KVM_MIPS_FPU_FPU) {
 			clear_c0_status(ST0_CU1 | ST0_FR);
+			disable_fpu_hazard();
+		}
 		vcpu->arch.fpu_inuse &= ~(KVM_MIPS_FPU_FPU | KVM_MIPS_FPU_MSA);
 	} else if (vcpu->arch.fpu_inuse & KVM_MIPS_FPU_FPU) {
 		set_c0_status(ST0_CU1);
@@ -1567,6 +1571,7 @@ void kvm_lose_fpu(struct kvm_vcpu *vcpu)
 
 		/* Disable FPU */
 		clear_c0_status(ST0_CU1 | ST0_FR);
+		disable_fpu_hazard();
 	}
 	preempt_enable();
 }

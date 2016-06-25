@@ -376,7 +376,7 @@ static int moxart_mac_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	priv->tx_head = TX_NEXT(tx_head);
 
-	ndev->trans_start = jiffies;
+	netif_trans_update(ndev);
 	ret = NETDEV_TX_OK;
 out_unlock:
 	spin_unlock_irq(&priv->txlock);
@@ -474,9 +474,9 @@ static int moxart_mac_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	ndev->base_addr = res->start;
 	priv->base = devm_ioremap_resource(p_dev, res);
-	ret = IS_ERR(priv->base);
-	if (ret) {
+	if (IS_ERR(priv->base)) {
 		dev_err(p_dev, "devm_ioremap_resource failed\n");
+		ret = PTR_ERR(priv->base);
 		goto init_fail;
 	}
 

@@ -409,7 +409,7 @@ asmlinkage void secondary_start_kernel(void)
 	/*
 	 * OK, it's off to the idle thread for us
 	 */
-	cpu_startup_entry(CPUHP_ONLINE);
+	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
 }
 
 void __init smp_cpus_done(unsigned int max_cpus)
@@ -644,9 +644,11 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 		break;
 
 	case IPI_CPU_BACKTRACE:
+		printk_nmi_enter();
 		irq_enter();
 		nmi_cpu_backtrace(regs);
 		irq_exit();
+		printk_nmi_exit();
 		break;
 
 	default:

@@ -40,8 +40,6 @@ struct inode;
 struct dentry;
 struct user_namespace;
 
-struct user_namespace *current_user_ns(void);
-
 extern const kernel_cap_t __cap_empty_set;
 extern const kernel_cap_t __cap_init_eff_set;
 
@@ -208,6 +206,7 @@ extern bool has_ns_capability_noaudit(struct task_struct *t,
 				      struct user_namespace *ns, int cap);
 extern bool capable(int cap);
 extern bool ns_capable(struct user_namespace *ns, int cap);
+extern bool ns_capable_noaudit(struct user_namespace *ns, int cap);
 #else
 static inline bool has_capability(struct task_struct *t, int cap)
 {
@@ -232,6 +231,10 @@ static inline bool capable(int cap)
 	return true;
 }
 static inline bool ns_capable(struct user_namespace *ns, int cap)
+{
+	return true;
+}
+static inline bool ns_capable_noaudit(struct user_namespace *ns, int cap)
 {
 	return true;
 }

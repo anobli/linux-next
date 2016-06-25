@@ -1683,7 +1683,7 @@ static int octeon_setup_droq(struct octeon_device *oct, int q_no, int num_descs,
 	dev_dbg(&oct->pci_dev->dev, "Creating Droq: %d\n", q_no);
 	/* droq creation and local register settings. */
 	ret_val = octeon_create_droq(oct, q_no, num_descs, desc_size, app_ctx);
-	if (ret_val == -1)
+	if (ret_val < 0)
 		return ret_val;
 
 	if (ret_val == 1) {
@@ -2524,7 +2524,7 @@ static void handle_timestamp(struct octeon_device *oct,
 
 	octeon_swap_8B_data(&resp->timestamp, 1);
 
-	if (unlikely((skb_shinfo(skb)->tx_flags | SKBTX_IN_PROGRESS) != 0)) {
+	if (unlikely((skb_shinfo(skb)->tx_flags & SKBTX_IN_PROGRESS) != 0)) {
 		struct skb_shared_hwtstamps ts;
 		u64 ns = resp->timestamp;
 
@@ -2899,7 +2899,7 @@ static int liquidio_xmit(struct sk_buff *skb, struct net_device *netdev)
 	if (status == IQ_SEND_STOP)
 		stop_q(lio->netdev, q_idx);
 
-	netdev->trans_start = jiffies;
+	netif_trans_update(netdev);
 
 	stats->tx_done++;
 	stats->tx_tot_bytes += skb->len;
@@ -2928,7 +2928,7 @@ static void liquidio_tx_timeout(struct net_device *netdev)
 	netif_info(lio, tx_err, lio->netdev,
 		   "Transmit timeout tx_dropped:%ld, waking up queues now!!\n",
 		   netdev->stats.tx_dropped);
-	netdev->trans_start = jiffies;
+	netif_trans_update(netdev);
 	txqs_wake(netdev);
 }
 

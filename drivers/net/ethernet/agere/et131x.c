@@ -2380,7 +2380,7 @@ static int et131x_tx_dma_memory_alloc(struct et131x_adapter *adapter)
 						    sizeof(u32),
 						    &tx_ring->tx_status_pa,
 						    GFP_KERNEL);
-	if (!tx_ring->tx_status_pa) {
+	if (!tx_ring->tx_status) {
 		dev_err(&adapter->pdev->dev,
 			"Cannot alloc memory for Tx status block\n");
 		return -ENOMEM;
@@ -3349,7 +3349,7 @@ static void et131x_down(struct net_device *netdev)
 	struct et131x_adapter *adapter = netdev_priv(netdev);
 
 	/* Save the timestamp for the TX watchdog, prevent a timeout */
-	netdev->trans_start = jiffies;
+	netif_trans_update(netdev);
 
 	phy_stop(adapter->phydev);
 	et131x_disable_txrx(netdev);
@@ -3816,7 +3816,7 @@ static netdev_tx_t et131x_tx(struct sk_buff *skb, struct net_device *netdev)
 		netif_stop_queue(netdev);
 
 	/* Save the timestamp for the TX timeout watchdog */
-	netdev->trans_start = jiffies;
+	netif_trans_update(netdev);
 
 	/* TCB is not available */
 	if (tx_ring->used >= NUM_TCB)

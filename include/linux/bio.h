@@ -41,7 +41,7 @@
 #endif
 
 #define BIO_MAX_PAGES		256
-#define BIO_MAX_SIZE		(BIO_MAX_PAGES << PAGE_CACHE_SHIFT)
+#define BIO_MAX_SIZE		(BIO_MAX_PAGES << PAGE_SHIFT)
 #define BIO_MAX_SECTORS		(BIO_MAX_SIZE >> 9)
 
 /*
@@ -308,6 +308,38 @@ static inline void bio_set_flag(struct bio *bio, unsigned int bit)
 static inline void bio_clear_flag(struct bio *bio, unsigned int bit)
 {
 	bio->bi_flags &= ~(1U << bit);
+}
+
+static inline void bio_get_first_bvec(struct bio *bio, struct bio_vec *bv)
+{
+	*bv = bio_iovec(bio);
+}
+
+static inline void bio_get_last_bvec(struct bio *bio, struct bio_vec *bv)
+{
+	struct bvec_iter iter = bio->bi_iter;
+	int idx;
+
+	if (unlikely(!bio_multiple_segments(bio))) {
+		*bv = bio_iovec(bio);
+		return;
+	}
+
+	bio_advance_iter(bio, &iter, iter.bi_size);
+
+	if (!iter.bi_bvec_done)
+		idx = iter.bi_idx - 1;
+	else	/* in the middle of bvec */
+		idx = iter.bi_idx;
+
+	*bv = bio->bi_io_vec[idx];
+
+	/*
+	 * iter.bi_bvec_done records actual length of the last bvec
+	 * if this bio ends in the middle of one io vector
+	 */
+	if (iter.bi_bvec_done)
+		bv->bv_len = iter.bi_bvec_done;
 }
 
 enum bip_flags {
@@ -668,6 +700,17 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
 	bl->head = bl->tail = NULL;
 
 	return bio;
+}
+
+/*
+ * Increment chain count for the bio. Make sure the CHAIN flag update
+ * is visible before the raised count.
+ */
+static inline void bio_inc_remaining(struct bio *bio)
+{
+	bio_set_flag(bio, BIO_CHAIN);
+	smp_mb__before_atomic();
+	atomic_inc(&bio->__bi_remaining);
 }
 
 /*

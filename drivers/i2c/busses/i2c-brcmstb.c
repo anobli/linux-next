@@ -446,9 +446,7 @@ static int brcmstb_i2c_do_addr(struct brcmstb_i2c_dev *dev,
 
 		}
 	} else {
-		addr = msg->addr << 1;
-		if (msg->flags & I2C_M_RD)
-			addr |= 1;
+		addr = i2c_8bit_addr_from_msg(msg);
 
 		bsc_writel(dev, addr, chip_address);
 	}
@@ -586,8 +584,7 @@ static int brcmstb_i2c_probe(struct platform_device *pdev)
 	if (!dev)
 		return -ENOMEM;
 
-	dev->bsc_regmap = devm_kzalloc(&pdev->dev, sizeof(struct bsc_regs *),
-				       GFP_KERNEL);
+	dev->bsc_regmap = devm_kzalloc(&pdev->dev, sizeof(*dev->bsc_regmap), GFP_KERNEL);
 	if (!dev->bsc_regmap)
 		return -ENOMEM;
 

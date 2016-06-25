@@ -60,7 +60,6 @@ struct decon_context {
 	wait_queue_head_t		wait_vsync_queue;
 	atomic_t			wait_vsync_event;
 
-	struct exynos_drm_panel_info panel;
 	struct drm_encoder *encoder;
 };
 
@@ -594,7 +593,6 @@ static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.commit = decon_commit,
 	.enable_vblank = decon_enable_vblank,
 	.disable_vblank = decon_disable_vblank,
-	.wait_for_vblank = decon_wait_for_vblank,
 	.atomic_begin = decon_atomic_begin,
 	.update_plane = decon_update_plane,
 	.disable_plane = decon_disable_plane,

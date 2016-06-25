@@ -22,6 +22,7 @@
 #include "../disk-io.h"
 #include "../extent_io.h"
 #include "../volumes.h"
+#include "../compression.h"
 
 static void insert_extent(struct btrfs_root *root, u64 start, u64 len,
 			  u64 ram_bytes, u64 offset, u64 disk_bytenr,
@@ -263,7 +264,7 @@ static noinline int test_btrfs_get_extent(void)
 
 	/*
 	 * We will just free a dummy node if it's ref count is 2 so we need an
-	 * extra ref so our searches don't accidently release our page.
+	 * extra ref so our searches don't accidentally release our page.
 	 */
 	extent_buffer_get(root->node);
 	btrfs_set_header_nritems(root->node, 0);

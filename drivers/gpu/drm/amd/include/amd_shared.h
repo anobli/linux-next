@@ -48,6 +48,8 @@ enum amd_asic_type {
 	CHIP_FIJI,
 	CHIP_CARRIZO,
 	CHIP_STONEY,
+	CHIP_POLARIS10,
+	CHIP_POLARIS11,
 	CHIP_LAST,
 };
 
@@ -73,6 +75,7 @@ enum amd_ip_block_type {
 	AMD_IP_BLOCK_TYPE_SDMA,
 	AMD_IP_BLOCK_TYPE_UVD,
 	AMD_IP_BLOCK_TYPE_VCE,
+	AMD_IP_BLOCK_TYPE_ACP,
 };
 
 enum amd_clockgating_state {
@@ -84,6 +87,39 @@ enum amd_powergating_state {
 	AMD_PG_STATE_GATE = 0,
 	AMD_PG_STATE_UNGATE,
 };
+
+/* CG flags */
+#define AMD_CG_SUPPORT_GFX_MGCG			(1 << 0)
+#define AMD_CG_SUPPORT_GFX_MGLS			(1 << 1)
+#define AMD_CG_SUPPORT_GFX_CGCG			(1 << 2)
+#define AMD_CG_SUPPORT_GFX_CGLS			(1 << 3)
+#define AMD_CG_SUPPORT_GFX_CGTS			(1 << 4)
+#define AMD_CG_SUPPORT_GFX_CGTS_LS		(1 << 5)
+#define AMD_CG_SUPPORT_GFX_CP_LS		(1 << 6)
+#define AMD_CG_SUPPORT_GFX_RLC_LS		(1 << 7)
+#define AMD_CG_SUPPORT_MC_LS			(1 << 8)
+#define AMD_CG_SUPPORT_MC_MGCG			(1 << 9)
+#define AMD_CG_SUPPORT_SDMA_LS			(1 << 10)
+#define AMD_CG_SUPPORT_SDMA_MGCG		(1 << 11)
+#define AMD_CG_SUPPORT_BIF_LS			(1 << 12)
+#define AMD_CG_SUPPORT_UVD_MGCG			(1 << 13)
+#define AMD_CG_SUPPORT_VCE_MGCG			(1 << 14)
+#define AMD_CG_SUPPORT_HDP_LS			(1 << 15)
+#define AMD_CG_SUPPORT_HDP_MGCG			(1 << 16)
+#define AMD_CG_SUPPORT_ROM_MGCG			(1 << 17)
+
+/* PG flags */
+#define AMD_PG_SUPPORT_GFX_PG			(1 << 0)
+#define AMD_PG_SUPPORT_GFX_SMG			(1 << 1)
+#define AMD_PG_SUPPORT_GFX_DMG			(1 << 2)
+#define AMD_PG_SUPPORT_UVD			(1 << 3)
+#define AMD_PG_SUPPORT_VCE			(1 << 4)
+#define AMD_PG_SUPPORT_CP			(1 << 5)
+#define AMD_PG_SUPPORT_GDS			(1 << 6)
+#define AMD_PG_SUPPORT_RLC_SMU_HS		(1 << 7)
+#define AMD_PG_SUPPORT_SDMA			(1 << 8)
+#define AMD_PG_SUPPORT_ACP			(1 << 9)
+#define AMD_PG_SUPPORT_SAMU			(1 << 10)
 
 enum amd_pm_state_type {
 	/* not used for dpm */
@@ -107,6 +143,8 @@ enum amd_pm_state_type {
 };
 
 struct amd_ip_funcs {
+	/* Name of IP block */
+	char *name;
 	/* sets up early driver state (pre sw_init), does not configure hw - Optional */
 	int (*early_init)(void *handle);
 	/* sets up late driver/hw state (post hw_init) - Optional */
@@ -129,8 +167,6 @@ struct amd_ip_funcs {
 	int (*wait_for_idle)(void *handle);
 	/* soft reset the IP block */
 	int (*soft_reset)(void *handle);
-	/* dump the IP block status registers */
-	void (*print_status)(void *handle);
 	/* enable/disable cg for the IP block */
 	int (*set_clockgating_state)(void *handle,
 				     enum amd_clockgating_state state);

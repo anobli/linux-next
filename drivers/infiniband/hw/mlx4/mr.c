@@ -32,6 +32,7 @@
  */
 
 #include <linux/slab.h>
+#include <rdma/ib_user_verbs.h>
 
 #include "mlx4_ib.h"
 
@@ -334,7 +335,8 @@ int mlx4_ib_dereg_mr(struct ib_mr *ibmr)
 	return 0;
 }
 
-struct ib_mw *mlx4_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type)
+struct ib_mw *mlx4_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
+			       struct ib_udata *udata)
 {
 	struct mlx4_ib_dev *dev = to_mdev(pd->device);
 	struct mlx4_ib_mw *mw;
@@ -526,9 +528,8 @@ static int mlx4_set_page(struct ib_mr *ibmr, u64 addr)
 	return 0;
 }
 
-int mlx4_ib_map_mr_sg(struct ib_mr *ibmr,
-		      struct scatterlist *sg,
-		      int sg_nents)
+int mlx4_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
+		      unsigned int *sg_offset)
 {
 	struct mlx4_ib_mr *mr = to_mmr(ibmr);
 	int rc;
@@ -539,7 +540,7 @@ int mlx4_ib_map_mr_sg(struct ib_mr *ibmr,
 				   sizeof(u64) * mr->max_pages,
 				   DMA_TO_DEVICE);
 
-	rc = ib_sg_to_pages(ibmr, sg, sg_nents, mlx4_set_page);
+	rc = ib_sg_to_pages(ibmr, sg, sg_nents, sg_offset, mlx4_set_page);
 
 	ib_dma_sync_single_for_device(ibmr->device, mr->page_map,
 				      sizeof(u64) * mr->max_pages,

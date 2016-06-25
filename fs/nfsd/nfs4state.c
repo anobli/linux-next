@@ -2408,7 +2408,8 @@ nfsd4_exchange_id(struct svc_rqst *rqstp,
 	default:				/* checked by xdr code */
 		WARN_ON_ONCE(1);
 	case SP4_SSV:
-		return nfserr_encr_alg_unsupp;
+		status = nfserr_encr_alg_unsupp;
+		goto out_nolock;
 	}
 
 	/* Cases below refer to rfc 5661 section 18.35.4: */
@@ -2586,21 +2587,26 @@ static __be32 check_forechannel_attrs(struct nfsd4_channel_attrs *ca, struct nfs
 	return nfs_ok;
 }
 
+/*
+ * Server's NFSv4.1 backchannel support is AUTH_SYS-only for now.
+ * These are based on similar macros in linux/sunrpc/msg_prot.h .
+ */
+#define RPC_MAX_HEADER_WITH_AUTH_SYS \
+	(RPC_CALLHDRSIZE + 2 * (2 + UNX_CALLSLACK))
+
+#define RPC_MAX_REPHEADER_WITH_AUTH_SYS \
+	(RPC_REPHDRSIZE + (2 + NUL_REPLYSLACK))
+
 #define NFSD_CB_MAX_REQ_SZ	((NFS4_enc_cb_recall_sz + \
-				 RPC_MAX_HEADER_WITH_AUTH) * sizeof(__be32))
+				 RPC_MAX_HEADER_WITH_AUTH_SYS) * sizeof(__be32))
 #define NFSD_CB_MAX_RESP_SZ	((NFS4_dec_cb_recall_sz + \
-				 RPC_MAX_REPHEADER_WITH_AUTH) * sizeof(__be32))
+				 RPC_MAX_REPHEADER_WITH_AUTH_SYS) * \
+				 sizeof(__be32))
 
 static __be32 check_backchannel_attrs(struct nfsd4_channel_attrs *ca)
 {
 	ca->headerpadsz = 0;
 
-	/*
-	 * These RPC_MAX_HEADER macros are overkill, especially since we
-	 * don't even do gss on the backchannel yet.  But this is still
-	 * less than 1k.  Tighten up this estimate in the unlikely event
-	 * it turns out to be a problem for some client:
-	 */
 	if (ca->maxreq_sz < NFSD_CB_MAX_REQ_SZ)
 		return nfserr_toosmall;
 	if (ca->maxresp_sz < NFSD_CB_MAX_RESP_SZ)
@@ -2710,10 +2716,9 @@ nfsd4_create_session(struct svc_rqst *rqstp,
 		goto out_free_conn;
 	}
 	status = nfs_ok;
-	/*
-	 * We do not support RDMA or persistent sessions
-	 */
+	/* Persistent sessions are not supported */
 	cr_ses->flags &= ~SESSION4_PERSIST;
+	/* Upshifting from TCP to RDMA is not supported */
 	cr_ses->flags &= ~SESSION4_RDMA;
 
 	init_session(rqstp, new, conf, cr_ses);
@@ -4646,12 +4651,6 @@ grace_disallows_io(struct net *net, struct inode *inode)
 	return opens_in_grace(net) && mandatory_lock(inode);
 }
 
-/* Returns true iff a is later than b: */
-static bool stateid_generation_after(stateid_t *a, stateid_t *b)
-{
-	return (s32)(a->si_generation - b->si_generation) > 0;
-}
-
 static __be32 check_stateid_generation(stateid_t *in, stateid_t *ref, bool has_session)
 {
 	/*
@@ -4665,7 +4664,7 @@ static __be32 check_stateid_generation(stateid_t *in, stateid_t *ref, bool has_s
 		return nfs_ok;
 
 	/* If the client sends us a stateid from the future, it's buggy: */
-	if (stateid_generation_after(in, ref))
+	if (nfsd4_stateid_generation_after(in, ref))
 		return nfserr_bad_stateid;
 	/*
 	 * However, we could see a stateid from the past, even from a

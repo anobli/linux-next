@@ -227,7 +227,7 @@ static int ast_get_dram_info(struct drm_device *dev)
 	} while (ast_read32(ast, 0x10000) != 0x01);
 	data = ast_read32(ast, 0x10004);
 
-	if (data & 0x400)
+	if (data & 0x40)
 		ast->dram_bus_width = 16;
 	else
 		ast->dram_bus_width = 32;
@@ -333,7 +333,7 @@ ast_user_framebuffer_create(struct drm_device *dev,
 	struct ast_framebuffer *ast_fb;
 	int ret;
 
-	obj = drm_gem_object_lookup(dev, filp, mode_cmd->handles[0]);
+	obj = drm_gem_object_lookup(filp, mode_cmd->handles[0]);
 	if (obj == NULL)
 		return ERR_PTR(-ENOENT);
 
@@ -574,7 +574,7 @@ ast_dumb_mmap_offset(struct drm_file *file,
 	struct drm_gem_object *obj;
 	struct ast_bo *bo;
 
-	obj = drm_gem_object_lookup(dev, file, handle);
+	obj = drm_gem_object_lookup(file, handle);
 	if (obj == NULL)
 		return -ENOENT;
 

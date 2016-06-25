@@ -2254,6 +2254,7 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 {
 	u32 intmsk;
 	u32 val;
+	u32 usbcfg;
 
 	/* Kill any ep0 requests as controller will be reinitialized */
 	kill_all_requests(hsotg, hsotg->eps_out[0], -ECONNRESET);
@@ -2267,10 +2268,16 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 	 * set configuration.
 	 */
 
+	/* keep other bits untouched (so e.g. forced modes are not lost) */
+	usbcfg = dwc2_readl(hsotg->regs + GUSBCFG);
+	usbcfg &= ~(GUSBCFG_TOUTCAL_MASK | GUSBCFG_PHYIF16 | GUSBCFG_SRPCAP |
+		GUSBCFG_HNPCAP);
+
 	/* set the PLL on, remove the HNP/SRP and set the PHY */
 	val = (hsotg->phyif == GUSBCFG_PHYIF8) ? 9 : 5;
-	dwc2_writel(hsotg->phyif | GUSBCFG_TOUTCAL(7) |
-	       (val << GUSBCFG_USBTRDTIM_SHIFT), hsotg->regs + GUSBCFG);
+	usbcfg |= hsotg->phyif | GUSBCFG_TOUTCAL(7) |
+		(val << GUSBCFG_USBTRDTIM_SHIFT);
+	dwc2_writel(usbcfg, hsotg->regs + GUSBCFG);
 
 	dwc2_hsotg_init_fifo(hsotg);
 
@@ -2417,6 +2424,9 @@ static irqreturn_t dwc2_hsotg_irq(int irq, void *pw)
 	int retry_count = 8;
 	u32 gintsts;
 	u32 gintmsk;
+
+	if (!dwc2_is_device_mode(hsotg))
+		return IRQ_NONE;
 
 	spin_lock(&hsotg->lock);
 irq_retry:
@@ -2624,7 +2634,10 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 		desc->wMaxPacketSize, desc->bInterval);
 
 	/* not to be called for EP0 */
-	WARN_ON(index == 0);
+	if (index == 0) {
+		dev_err(hsotg->dev, "%s: called for EP 0\n", __func__);
+		return -EINVAL;
+	}
 
 	dir_in = (desc->bEndpointAddress & USB_ENDPOINT_DIR_MASK) ? 1 : 0;
 	if (dir_in != hs_ep->dir_in) {
@@ -3031,6 +3044,7 @@ static struct usb_ep_ops dwc2_hsotg_ep_ops = {
 static void dwc2_hsotg_init(struct dwc2_hsotg *hsotg)
 {
 	u32 trdtim;
+	u32 usbcfg;
 	/* unmask subset of endpoint interrupts */
 
 	dwc2_writel(DIEPMSK_TIMEOUTMSK | DIEPMSK_AHBERRMSK |
@@ -3054,11 +3068,16 @@ static void dwc2_hsotg_init(struct dwc2_hsotg *hsotg)
 
 	dwc2_hsotg_init_fifo(hsotg);
 
+	/* keep other bits untouched (so e.g. forced modes are not lost) */
+	usbcfg = dwc2_readl(hsotg->regs + GUSBCFG);
+	usbcfg &= ~(GUSBCFG_TOUTCAL_MASK | GUSBCFG_PHYIF16 | GUSBCFG_SRPCAP |
+		GUSBCFG_HNPCAP);
+
 	/* set the PLL on, remove the HNP/SRP and set the PHY */
 	trdtim = (hsotg->phyif == GUSBCFG_PHYIF8) ? 9 : 5;
-	dwc2_writel(hsotg->phyif | GUSBCFG_TOUTCAL(7) |
-		(trdtim << GUSBCFG_USBTRDTIM_SHIFT),
-		hsotg->regs + GUSBCFG);
+	usbcfg |= hsotg->phyif | GUSBCFG_TOUTCAL(7) |
+		(trdtim << GUSBCFG_USBTRDTIM_SHIFT);
+	dwc2_writel(usbcfg, hsotg->regs + GUSBCFG);
 
 	if (using_dma(hsotg))
 		__orr32(hsotg->regs + GAHBCFG, GAHBCFG_DMA_EN);
@@ -3665,6 +3684,108 @@ int dwc2_hsotg_resume(struct dwc2_hsotg *hsotg)
 			dwc2_hsotg_core_connect(hsotg);
 		spin_unlock_irqrestore(&hsotg->lock, flags);
 	}
+
+	return 0;
+}
+
+/**
+ * dwc2_backup_device_registers() - Backup controller device registers.
+ * When suspending usb bus, registers needs to be backuped
+ * if controller power is disabled once suspended.
+ *
+ * @hsotg: Programming view of the DWC_otg controller
+ */
+int dwc2_backup_device_registers(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_dregs_backup *dr;
+	int i;
+
+	dev_dbg(hsotg->dev, "%s\n", __func__);
+
+	/* Backup dev regs */
+	dr = &hsotg->dr_backup;
+
+	dr->dcfg = dwc2_readl(hsotg->regs + DCFG);
+	dr->dctl = dwc2_readl(hsotg->regs + DCTL);
+	dr->daintmsk = dwc2_readl(hsotg->regs + DAINTMSK);
+	dr->diepmsk = dwc2_readl(hsotg->regs + DIEPMSK);
+	dr->doepmsk = dwc2_readl(hsotg->regs + DOEPMSK);
+
+	for (i = 0; i < hsotg->num_of_eps; i++) {
+		/* Backup IN EPs */
+		dr->diepctl[i] = dwc2_readl(hsotg->regs + DIEPCTL(i));
+
+		/* Ensure DATA PID is correctly configured */
+		if (dr->diepctl[i] & DXEPCTL_DPID)
+			dr->diepctl[i] |= DXEPCTL_SETD1PID;
+		else
+			dr->diepctl[i] |= DXEPCTL_SETD0PID;
+
+		dr->dieptsiz[i] = dwc2_readl(hsotg->regs + DIEPTSIZ(i));
+		dr->diepdma[i] = dwc2_readl(hsotg->regs + DIEPDMA(i));
+
+		/* Backup OUT EPs */
+		dr->doepctl[i] = dwc2_readl(hsotg->regs + DOEPCTL(i));
+
+		/* Ensure DATA PID is correctly configured */
+		if (dr->doepctl[i] & DXEPCTL_DPID)
+			dr->doepctl[i] |= DXEPCTL_SETD1PID;
+		else
+			dr->doepctl[i] |= DXEPCTL_SETD0PID;
+
+		dr->doeptsiz[i] = dwc2_readl(hsotg->regs + DOEPTSIZ(i));
+		dr->doepdma[i] = dwc2_readl(hsotg->regs + DOEPDMA(i));
+	}
+	dr->valid = true;
+	return 0;
+}
+
+/**
+ * dwc2_restore_device_registers() - Restore controller device registers.
+ * When resuming usb bus, device registers needs to be restored
+ * if controller power were disabled.
+ *
+ * @hsotg: Programming view of the DWC_otg controller
+ */
+int dwc2_restore_device_registers(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_dregs_backup *dr;
+	u32 dctl;
+	int i;
+
+	dev_dbg(hsotg->dev, "%s\n", __func__);
+
+	/* Restore dev regs */
+	dr = &hsotg->dr_backup;
+	if (!dr->valid) {
+		dev_err(hsotg->dev, "%s: no device registers to restore\n",
+			__func__);
+		return -EINVAL;
+	}
+	dr->valid = false;
+
+	dwc2_writel(dr->dcfg, hsotg->regs + DCFG);
+	dwc2_writel(dr->dctl, hsotg->regs + DCTL);
+	dwc2_writel(dr->daintmsk, hsotg->regs + DAINTMSK);
+	dwc2_writel(dr->diepmsk, hsotg->regs + DIEPMSK);
+	dwc2_writel(dr->doepmsk, hsotg->regs + DOEPMSK);
+
+	for (i = 0; i < hsotg->num_of_eps; i++) {
+		/* Restore IN EPs */
+		dwc2_writel(dr->diepctl[i], hsotg->regs + DIEPCTL(i));
+		dwc2_writel(dr->dieptsiz[i], hsotg->regs + DIEPTSIZ(i));
+		dwc2_writel(dr->diepdma[i], hsotg->regs + DIEPDMA(i));
+
+		/* Restore OUT EPs */
+		dwc2_writel(dr->doepctl[i], hsotg->regs + DOEPCTL(i));
+		dwc2_writel(dr->doeptsiz[i], hsotg->regs + DOEPTSIZ(i));
+		dwc2_writel(dr->doepdma[i], hsotg->regs + DOEPDMA(i));
+	}
+
+	/* Set the Power-On Programming done bit */
+	dctl = dwc2_readl(hsotg->regs + DCTL);
+	dctl |= DCTL_PWRONPRGDONE;
+	dwc2_writel(dctl, hsotg->regs + DCTL);
 
 	return 0;
 }

@@ -1107,6 +1107,11 @@ int ext4_htree_fill_tree(struct file *dir_file, __u32 start_hash,
 	}
 
 	while (1) {
+		if (fatal_signal_pending(current)) {
+			err = -ERESTARTSYS;
+			goto errout;
+		}
+		cond_resched();
 		block = dx_get_block(frame->at);
 		ret = htree_dirblock_to_tree(dir_file, dir, block, &hinfo,
 					     start_hash, start_minor_hash);
@@ -1558,6 +1563,24 @@ static struct dentry *ext4_lookup(struct inode *dir, struct dentry *dentry, unsi
 	struct ext4_dir_entry_2 *de;
 	struct buffer_head *bh;
 
+       if (ext4_encrypted_inode(dir)) {
+               int res = ext4_get_encryption_info(dir);
+
+		/*
+		 * This should be a properly defined flag for
+		 * dentry->d_flags when we uplift this to the VFS.
+		 * d_fsdata is set to (void *) 1 if if the dentry is
+		 * created while the directory was encrypted and we
+		 * don't have access to the key.
+		 */
+	       dentry->d_fsdata = NULL;
+	       if (ext4_encryption_info(dir))
+		       dentry->d_fsdata = (void *) 1;
+	       d_set_d_op(dentry, &ext4_encrypted_d_ops);
+	       if (res && res != -ENOKEY)
+		       return ERR_PTR(res);
+       }
+
 	if (dentry->d_name.len > EXT4_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
@@ -1585,13 +1608,17 @@ static struct dentry *ext4_lookup(struct inode *dir, struct dentry *dentry, unsi
 			return ERR_PTR(-EFSCORRUPTED);
 		}
 		if (!IS_ERR(inode) && ext4_encrypted_inode(dir) &&
-		    (S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) ||
-		     S_ISLNK(inode->i_mode)) &&
+		    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
 		    !ext4_is_child_context_consistent_with_parent(dir,
 								  inode)) {
+			int nokey = ext4_encrypted_inode(inode) &&
+				!ext4_encryption_info(inode);
+
 			iput(inode);
+			if (nokey)
+				return ERR_PTR(-ENOKEY);
 			ext4_warning(inode->i_sb,
-				     "Inconsistent encryption contexts: %lu/%lu\n",
+				     "Inconsistent encryption contexts: %lu/%lu",
 				     (unsigned long) dir->i_ino,
 				     (unsigned long) inode->i_ino);
 			return ERR_PTR(-EPERM);
@@ -1616,13 +1643,13 @@ struct dentry *ext4_get_parent(struct dentry *child)
 	ino = le32_to_cpu(de->inode);
 	brelse(bh);
 
-	if (!ext4_valid_inum(d_inode(child)->i_sb, ino)) {
+	if (!ext4_valid_inum(child->d_sb, ino)) {
 		EXT4_ERROR_INODE(d_inode(child),
 				 "bad parent inode number: %u", ino);
 		return ERR_PTR(-EFSCORRUPTED);
 	}
 
-	return d_obtain_alias(ext4_iget_normal(d_inode(child)->i_sb, ino));
+	return d_obtain_alias(ext4_iget_normal(child->d_sb, ino));
 }
 
 /*
@@ -2806,7 +2833,7 @@ int ext4_orphan_add(handle_t *handle, struct inode *inode)
 			 * list entries can cause panics at unmount time.
 			 */
 			mutex_lock(&sbi->s_orphan_lock);
-			list_del(&EXT4_I(inode)->i_orphan);
+			list_del_init(&EXT4_I(inode)->i_orphan);
 			mutex_unlock(&sbi->s_orphan_lock);
 		}
 	}

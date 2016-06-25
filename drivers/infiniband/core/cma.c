@@ -800,6 +800,7 @@ int rdma_create_qp(struct rdma_cm_id *id, struct ib_pd *pd,
 	if (id->device != pd->device)
 		return -EINVAL;
 
+	qp_init_attr->port_num = id->port_num;
 	qp = ib_create_qp(pd, qp_init_attr);
 	if (IS_ERR(qp))
 		return PTR_ERR(qp);
@@ -1206,6 +1207,10 @@ static int cma_save_req_info(const struct ib_cm_event *ib_event,
 		req->has_gid	= true;
 		req->service_id	= req_param->primary_path->service_id;
 		req->pkey	= be16_to_cpu(req_param->primary_path->pkey);
+		if (req->pkey != req_param->bth_pkey)
+			pr_warn_ratelimited("RDMA CMA: got different BTH P_Key (0x%x) and primary path P_Key (0x%x)\n"
+					    "RDMA CMA: in the future this may cause the request to be dropped\n",
+					    req_param->bth_pkey, req->pkey);
 		break;
 	case IB_CM_SIDR_REQ_RECEIVED:
 		req->device	= sidr_param->listen_id->device;
@@ -1213,6 +1218,10 @@ static int cma_save_req_info(const struct ib_cm_event *ib_event,
 		req->has_gid	= false;
 		req->service_id	= sidr_param->service_id;
 		req->pkey	= sidr_param->pkey;
+		if (req->pkey != sidr_param->bth_pkey)
+			pr_warn_ratelimited("RDMA CMA: got different BTH P_Key (0x%x) and SIDR request payload P_Key (0x%x)\n"
+					    "RDMA CMA: in the future this may cause the request to be dropped\n",
+					    sidr_param->bth_pkey, req->pkey);
 		break;
 	default:
 		return -EINVAL;
@@ -1713,7 +1722,7 @@ static int cma_ib_handler(struct ib_cm_id *cm_id, struct ib_cm_event *ib_event)
 		event.param.conn.private_data_len = IB_CM_REJ_PRIVATE_DATA_SIZE;
 		break;
 	default:
-		printk(KERN_ERR "RDMA CMA: unexpected IB CM event: %d\n",
+		pr_err("RDMA CMA: unexpected IB CM event: %d\n",
 		       ib_event->event);
 		goto out;
 	}
@@ -2186,8 +2195,8 @@ static void cma_listen_on_dev(struct rdma_id_private *id_priv,
 
 	ret = rdma_listen(id, id_priv->backlog);
 	if (ret)
-		printk(KERN_WARNING "RDMA CMA: cma_listen_on_dev, error %d, "
-		       "listening on device %s\n", ret, cma_dev->device->name);
+		pr_warn("RDMA CMA: cma_listen_on_dev, error %d, listening on device %s\n",
+			ret, cma_dev->device->name);
 }
 
 static void cma_listen_on_all(struct rdma_id_private *id_priv)
@@ -3239,7 +3248,7 @@ static int cma_sidr_rep_handler(struct ib_cm_id *cm_id,
 		event.status = 0;
 		break;
 	default:
-		printk(KERN_ERR "RDMA CMA: unexpected IB CM event: %d\n",
+		pr_err("RDMA CMA: unexpected IB CM event: %d\n",
 		       ib_event->event);
 		goto out;
 	}
@@ -4003,8 +4012,8 @@ static int cma_netdev_change(struct net_device *ndev, struct rdma_id_private *id
 	if ((dev_addr->bound_dev_if == ndev->ifindex) &&
 	    (net_eq(dev_net(ndev), dev_addr->net)) &&
 	    memcmp(dev_addr->src_dev_addr, ndev->dev_addr, ndev->addr_len)) {
-		printk(KERN_INFO "RDMA CM addr change for ndev %s used by id %p\n",
-		       ndev->name, &id_priv->id);
+		pr_info("RDMA CM addr change for ndev %s used by id %p\n",
+			ndev->name, &id_priv->id);
 		work = kzalloc(sizeof *work, GFP_KERNEL);
 		if (!work)
 			return -ENOMEM;
@@ -4286,8 +4295,9 @@ static int __init cma_init(void)
 	if (ret)
 		goto err;
 
-	if (ibnl_add_client(RDMA_NL_RDMA_CM, RDMA_NL_RDMA_CM_NUM_OPS, cma_cb_table))
-		printk(KERN_WARNING "RDMA CMA: failed to add netlink callback\n");
+	if (ibnl_add_client(RDMA_NL_RDMA_CM, ARRAY_SIZE(cma_cb_table),
+			    cma_cb_table))
+		pr_warn("RDMA CMA: failed to add netlink callback\n");
 	cma_configfs_init();
 
 	return 0;

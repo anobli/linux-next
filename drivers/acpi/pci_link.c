@@ -4,7 +4,6 @@
  *  Copyright (C) 2001, 2002 Andy Grover <andrew.grover@intel.com>
  *  Copyright (C) 2001, 2002 Paul Diefenbaugh <paul.s.diefenbaugh@intel.com>
  *  Copyright (C) 2002       Dominik Brodowski <devel@brodo.de>
- *  Copyright (c) 2015, The Linux Foundation. All rights reserved.
  *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
@@ -37,6 +36,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/irq.h>
 
 #include "internal.h"
 
@@ -438,16 +438,15 @@ static int acpi_pci_link_set(struct acpi_pci_link *link, int irq)
  * enabled system.
  */
 
-#define ACPI_MAX_ISA_IRQ	16
+#define ACPI_MAX_ISA_IRQS	16
 
-#define PIRQ_PENALTY_PCI_AVAILABLE	(0)
 #define PIRQ_PENALTY_PCI_POSSIBLE	(16*16)
 #define PIRQ_PENALTY_PCI_USING		(16*16*16)
 #define PIRQ_PENALTY_ISA_TYPICAL	(16*16*16*16)
 #define PIRQ_PENALTY_ISA_USED		(16*16*16*16*16)
 #define PIRQ_PENALTY_ISA_ALWAYS		(16*16*16*16*16*16)
 
-static int acpi_irq_isa_penalty[ACPI_MAX_ISA_IRQ] = {
+static int acpi_isa_irq_penalty[ACPI_MAX_ISA_IRQS] = {
 	PIRQ_PENALTY_ISA_ALWAYS,	/* IRQ0 timer */
 	PIRQ_PENALTY_ISA_ALWAYS,	/* IRQ1 keyboard */
 	PIRQ_PENALTY_ISA_ALWAYS,	/* IRQ2 cascade */
@@ -457,109 +456,68 @@ static int acpi_irq_isa_penalty[ACPI_MAX_ISA_IRQ] = {
 	PIRQ_PENALTY_ISA_TYPICAL,	/* IRQ6 */
 	PIRQ_PENALTY_ISA_TYPICAL,	/* IRQ7 parallel, spurious */
 	PIRQ_PENALTY_ISA_TYPICAL,	/* IRQ8 rtc, sometimes */
-	PIRQ_PENALTY_PCI_AVAILABLE,	/* IRQ9  PCI, often acpi */
-	PIRQ_PENALTY_PCI_AVAILABLE,	/* IRQ10 PCI */
-	PIRQ_PENALTY_PCI_AVAILABLE,	/* IRQ11 PCI */
+	0,				/* IRQ9  PCI, often acpi */
+	0,				/* IRQ10 PCI */
+	0,				/* IRQ11 PCI */
 	PIRQ_PENALTY_ISA_USED,		/* IRQ12 mouse */
 	PIRQ_PENALTY_ISA_USED,		/* IRQ13 fpe, sometimes */
 	PIRQ_PENALTY_ISA_USED,		/* IRQ14 ide0 */
 	PIRQ_PENALTY_ISA_USED,		/* IRQ15 ide1 */
+	/* >IRQ15 */
 };
 
-struct irq_penalty_info {
-	int irq;
-	int penalty;
-	struct list_head node;
-};
+static int acpi_irq_pci_sharing_penalty(int irq)
+{
+	struct acpi_pci_link *link;
+	int penalty = 0;
 
-static LIST_HEAD(acpi_irq_penalty_list);
+	list_for_each_entry(link, &acpi_link_list, list) {
+		/*
+		 * If a link is active, penalize its IRQ heavily
+		 * so we try to choose a different IRQ.
+		 */
+		if (link->irq.active && link->irq.active == irq)
+			penalty += PIRQ_PENALTY_PCI_USING;
+		else {
+			int i;
+
+			/*
+			 * If a link is inactive, penalize the IRQs it
+			 * might use, but not as severely.
+			 */
+			for (i = 0; i < link->irq.possible_count; i++)
+				if (link->irq.possible[i] == irq)
+					penalty += PIRQ_PENALTY_PCI_POSSIBLE /
+						link->irq.possible_count;
+		}
+	}
+
+	return penalty;
+}
 
 static int acpi_irq_get_penalty(int irq)
 {
-	struct irq_penalty_info *irq_info;
+	int penalty = 0;
 
-	if (irq < ACPI_MAX_ISA_IRQ)
-		return acpi_irq_isa_penalty[irq];
-
-	list_for_each_entry(irq_info, &acpi_irq_penalty_list, node) {
-		if (irq_info->irq == irq)
-			return irq_info->penalty;
-	}
-
-	return 0;
-}
-
-static int acpi_irq_set_penalty(int irq, int new_penalty)
-{
-	struct irq_penalty_info *irq_info;
-
-	/* see if this is a ISA IRQ */
-	if (irq < ACPI_MAX_ISA_IRQ) {
-		acpi_irq_isa_penalty[irq] = new_penalty;
-		return 0;
-	}
-
-	/* next, try to locate from the dynamic list */
-	list_for_each_entry(irq_info, &acpi_irq_penalty_list, node) {
-		if (irq_info->irq == irq) {
-			irq_info->penalty  = new_penalty;
-			return 0;
-		}
-	}
-
-	/* nope, let's allocate a slot for this IRQ */
-	irq_info = kzalloc(sizeof(*irq_info), GFP_KERNEL);
-	if (!irq_info)
-		return -ENOMEM;
-
-	irq_info->irq = irq;
-	irq_info->penalty = new_penalty;
-	list_add_tail(&irq_info->node, &acpi_irq_penalty_list);
-
-	return 0;
-}
-
-static void acpi_irq_add_penalty(int irq, int penalty)
-{
-	int curpen = acpi_irq_get_penalty(irq);
-
-	acpi_irq_set_penalty(irq, curpen + penalty);
-}
-
-int __init acpi_irq_penalty_init(void)
-{
-	struct acpi_pci_link *link;
-	int i;
+	if (irq < ACPI_MAX_ISA_IRQS)
+		penalty += acpi_isa_irq_penalty[irq];
 
 	/*
-	 * Update penalties to facilitate IRQ balancing.
-	 */
-	list_for_each_entry(link, &acpi_link_list, list) {
+	* Penalize IRQ used by ACPI SCI. If ACPI SCI pin attributes conflict
+	* with PCI IRQ attributes, mark ACPI SCI as ISA_ALWAYS so it won't be
+	* use for PCI IRQs.
+	*/
+	if (irq == acpi_gbl_FADT.sci_interrupt) {
+		u32 type = irq_get_trigger_type(irq) & IRQ_TYPE_SENSE_MASK;
 
-		/*
-		 * reflect the possible and active irqs in the penalty table --
-		 * useful for breaking ties.
-		 */
-		if (link->irq.possible_count) {
-			int penalty =
-			    PIRQ_PENALTY_PCI_POSSIBLE /
-			    link->irq.possible_count;
-
-			for (i = 0; i < link->irq.possible_count; i++) {
-				if (link->irq.possible[i] < ACPI_MAX_ISA_IRQ) {
-					int irqpos = link->irq.possible[i];
-
-					acpi_irq_add_penalty(irqpos, penalty);
-				}
-			}
-
-		} else if (link->irq.active) {
-			acpi_irq_add_penalty(link->irq.active,
-					     PIRQ_PENALTY_PCI_POSSIBLE);
-		}
+		if (type != IRQ_TYPE_LEVEL_LOW)
+			penalty += PIRQ_PENALTY_ISA_ALWAYS;
+		else
+			penalty += PIRQ_PENALTY_PCI_USING;
 	}
 
-	return 0;
+	penalty += acpi_irq_pci_sharing_penalty(irq);
+	return penalty;
 }
 
 static int acpi_irq_balance = -1;	/* 0: static, 1: balance */
@@ -628,8 +586,6 @@ static int acpi_pci_link_allocate(struct acpi_pci_link *link)
 			    acpi_device_bid(link->device));
 		return -ENODEV;
 	} else {
-		acpi_irq_add_penalty(link->irq.active, PIRQ_PENALTY_PCI_USING);
-
 		printk(KERN_WARNING PREFIX "%s [%s] enabled at IRQ %d\n",
 		       acpi_device_name(link->device),
 		       acpi_device_bid(link->device), link->irq.active);
@@ -839,7 +795,7 @@ static void acpi_pci_link_remove(struct acpi_device *device)
 }
 
 /*
- * modify penalty from cmdline
+ * modify acpi_isa_irq_penalty[] from cmdline
  */
 static int __init acpi_irq_penalty_update(char *str, int used)
 {
@@ -848,20 +804,24 @@ static int __init acpi_irq_penalty_update(char *str, int used)
 	for (i = 0; i < 16; i++) {
 		int retval;
 		int irq;
+		int new_penalty;
 
 		retval = get_option(&str, &irq);
 
 		if (!retval)
 			break;	/* no number found */
 
-		if (irq < 0)
+		/* see if this is a ISA IRQ */
+		if ((irq < 0) || (irq >= ACPI_MAX_ISA_IRQS))
 			continue;
 
 		if (used)
-			acpi_irq_add_penalty(irq, PIRQ_PENALTY_ISA_USED);
+			new_penalty = acpi_irq_get_penalty(irq) +
+					PIRQ_PENALTY_ISA_USED;
 		else
-			acpi_irq_set_penalty(irq, PIRQ_PENALTY_PCI_AVAILABLE);
+			new_penalty = 0;
 
+		acpi_isa_irq_penalty[irq] = new_penalty;
 		if (retval != 2)	/* no next number */
 			break;
 	}
@@ -877,36 +837,15 @@ static int __init acpi_irq_penalty_update(char *str, int used)
  */
 void acpi_penalize_isa_irq(int irq, int active)
 {
-	if (irq >= 0)
-		acpi_irq_add_penalty(irq, active ?
-			PIRQ_PENALTY_ISA_USED : PIRQ_PENALTY_PCI_USING);
+	if ((irq >= 0) && (irq < ARRAY_SIZE(acpi_isa_irq_penalty)))
+		acpi_isa_irq_penalty[irq] = acpi_irq_get_penalty(irq) +
+			active ? PIRQ_PENALTY_ISA_USED : PIRQ_PENALTY_PCI_USING;
 }
 
 bool acpi_isa_irq_available(int irq)
 {
-	return irq >= 0 &&
-		(acpi_irq_get_penalty(irq) < PIRQ_PENALTY_ISA_ALWAYS);
-}
-
-/*
- * Penalize IRQ used by ACPI SCI. If ACPI SCI pin attributes conflict with
- * PCI IRQ attributes, mark ACPI SCI as ISA_ALWAYS so it won't be use for
- * PCI IRQs.
- */
-void acpi_penalize_sci_irq(int irq, int trigger, int polarity)
-{
-	int penalty;
-
-	if (irq < 0)
-		return;
-
-	if (trigger != ACPI_MADT_TRIGGER_LEVEL ||
-	    polarity != ACPI_MADT_POLARITY_ACTIVE_LOW)
-		penalty = PIRQ_PENALTY_ISA_ALWAYS;
-	else
-		penalty = PIRQ_PENALTY_PCI_USING;
-
-	acpi_irq_add_penalty(irq, penalty);
+	return irq >= 0 && (irq >= ARRAY_SIZE(acpi_isa_irq_penalty) ||
+		    acpi_irq_get_penalty(irq) < PIRQ_PENALTY_ISA_ALWAYS);
 }
 
 /*

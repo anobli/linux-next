@@ -255,7 +255,8 @@ int fixed_phy_add(unsigned int irq, int phy_addr,
 
 	memset(fp->regs, 0xFF,  sizeof(fp->regs[0]) * MII_REGS_NUM);
 
-	fmb->mii_bus->irq[phy_addr] = irq;
+	if (irq != PHY_POLL)
+		fmb->mii_bus->irq[phy_addr] = irq;
 
 	fp->addr = phy_addr;
 	fp->status = *status;
@@ -285,7 +286,7 @@ err_regs:
 }
 EXPORT_SYMBOL_GPL(fixed_phy_add);
 
-void fixed_phy_del(int phy_addr)
+static void fixed_phy_del(int phy_addr)
 {
 	struct fixed_mdio_bus *fmb = &platform_fmb;
 	struct fixed_phy *fp, *tmp;
@@ -300,7 +301,6 @@ void fixed_phy_del(int phy_addr)
 		}
 	}
 }
-EXPORT_SYMBOL_GPL(fixed_phy_del);
 
 static int phy_fixed_addr;
 static DEFINE_SPINLOCK(phy_fixed_addr_lock);
@@ -314,6 +314,9 @@ struct phy_device *fixed_phy_register(unsigned int irq,
 	struct phy_device *phy;
 	int phy_addr;
 	int ret;
+
+	if (!fmb->mii_bus || fmb->mii_bus->state != MDIOBUS_REGISTERED)
+		return ERR_PTR(-EPROBE_DEFER);
 
 	/* Get the next available PHY address, up to PHY_MAX_ADDR */
 	spin_lock(&phy_fixed_addr_lock);
@@ -329,7 +332,7 @@ struct phy_device *fixed_phy_register(unsigned int irq,
 		return ERR_PTR(ret);
 
 	phy = get_phy_device(fmb->mii_bus, phy_addr, false);
-	if (!phy || IS_ERR(phy)) {
+	if (IS_ERR(phy)) {
 		fixed_phy_del(phy_addr);
 		return ERR_PTR(-EINVAL);
 	}
@@ -370,6 +373,14 @@ struct phy_device *fixed_phy_register(unsigned int irq,
 	return phy;
 }
 EXPORT_SYMBOL_GPL(fixed_phy_register);
+
+void fixed_phy_unregister(struct phy_device *phy)
+{
+	phy_device_remove(phy);
+
+	fixed_phy_del(phy->mdio.addr);
+}
+EXPORT_SYMBOL_GPL(fixed_phy_unregister);
 
 static int __init fixed_mdio_bus_init(void)
 {

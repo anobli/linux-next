@@ -13,8 +13,8 @@
 #include <linux/compat.h>
 #include <linux/mount.h>
 #include <linux/file.h>
-#include <linux/random.h>
 #include <linux/quotaops.h>
+#include <linux/uuid.h>
 #include <asm/uaccess.h>
 #include "ext4_jbd2.h"
 #include "ext4.h"
@@ -208,7 +208,7 @@ static int ext4_ioctl_setflags(struct inode *inode,
 {
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	handle_t *handle = NULL;
-	int err = EPERM, migrate = 0;
+	int err = -EPERM, migrate = 0;
 	struct ext4_iloc iloc;
 	unsigned int oldflags, mask, i;
 	unsigned int jflag;
@@ -365,7 +365,7 @@ static int ext4_ioctl_setproject(struct file *filp, __u32 projid)
 		struct dquot *transfer_to[MAXQUOTAS] = { };
 
 		transfer_to[PRJQUOTA] = dqget(sb, make_kqid_projid(kprojid));
-		if (transfer_to[PRJQUOTA]) {
+		if (!IS_ERR(transfer_to[PRJQUOTA])) {
 			err = __dquot_transfer(inode, transfer_to);
 			dqput(transfer_to[PRJQUOTA]);
 			if (err)
@@ -581,6 +581,11 @@ group_extend_out:
 		if (ext4_has_feature_bigalloc(sb)) {
 			ext4_msg(sb, KERN_ERR,
 				 "Online defrag not supported with bigalloc");
+			err = -EOPNOTSUPP;
+			goto mext_out;
+		} else if (IS_DAX(inode)) {
+			ext4_msg(sb, KERN_ERR,
+				 "Online defrag not supported with DAX");
 			err = -EOPNOTSUPP;
 			goto mext_out;
 		}

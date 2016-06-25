@@ -146,8 +146,17 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
 static void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 {
 	struct stackframe frame;
-	unsigned long irq_stack_ptr = IRQ_STACK_PTR(smp_processor_id());
+	unsigned long irq_stack_ptr;
 	int skip;
+
+	/*
+	 * Switching between stacks is valid when tracing current and in
+	 * non-preemptible context.
+	 */
+	if (tsk == current && !preemptible())
+		irq_stack_ptr = IRQ_STACK_PTR(smp_processor_id());
+	else
+		irq_stack_ptr = 0;
 
 	pr_debug("%s(regs = %p tsk = %p)\n", __func__, regs, tsk);
 
@@ -468,8 +477,9 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 	void __user *pc = (void __user *)instruction_pointer(regs);
 	console_verbose();
 
-	pr_crit("Bad mode in %s handler detected, code 0x%08x -- %s\n",
-		handler[reason], esr, esr_get_class_string(esr));
+	pr_crit("Bad mode in %s handler detected on CPU%d, code 0x%08x -- %s\n",
+		handler[reason], smp_processor_id(), esr,
+		esr_get_class_string(esr));
 	__show_regs(regs);
 
 	info.si_signo = SIGILL;
