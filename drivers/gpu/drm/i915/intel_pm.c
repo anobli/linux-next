@@ -3879,6 +3879,19 @@ static int skl_update_pipe_wm(struct drm_crtc_state *cstate,
 	return 0;
 }
 
+static uint32_t
+pipes_modified(struct drm_atomic_state *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *cstate;
+	uint32_t i, ret = 0;
+
+	for_each_crtc_in_state(state, crtc, cstate, i)
+		ret |= drm_crtc_mask(crtc);
+
+	return ret;
+}
+
 static int
 skl_compute_ddb(struct drm_atomic_state *state)
 {
@@ -3887,7 +3900,7 @@ skl_compute_ddb(struct drm_atomic_state *state)
 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
 	struct intel_crtc *intel_crtc;
 	struct skl_ddb_allocation *ddb = &intel_state->wm_results.ddb;
-	unsigned realloc_pipes = dev_priv->active_crtcs;
+	uint32_t realloc_pipes = pipes_modified(state);
 	int ret;
 
 	/*
@@ -4654,19 +4667,23 @@ static void gen6_set_rps_thresholds(struct drm_i915_private *dev_priv, u8 val)
 	new_power = dev_priv->rps.power;
 	switch (dev_priv->rps.power) {
 	case LOW_POWER:
-		if (val > dev_priv->rps.efficient_freq + 1 && val > dev_priv->rps.cur_freq)
+		if (val > dev_priv->rps.efficient_freq + 1 &&
+		    val > dev_priv->rps.cur_freq)
 			new_power = BETWEEN;
 		break;
 
 	case BETWEEN:
-		if (val <= dev_priv->rps.efficient_freq && val < dev_priv->rps.cur_freq)
+		if (val <= dev_priv->rps.efficient_freq &&
+		    val < dev_priv->rps.cur_freq)
 			new_power = LOW_POWER;
-		else if (val >= dev_priv->rps.rp0_freq && val > dev_priv->rps.cur_freq)
+		else if (val >= dev_priv->rps.rp0_freq &&
+			 val > dev_priv->rps.cur_freq)
 			new_power = HIGH_POWER;
 		break;
 
 	case HIGH_POWER:
-		if (val < (dev_priv->rps.rp1_freq + dev_priv->rps.rp0_freq) >> 1 && val < dev_priv->rps.cur_freq)
+		if (val < (dev_priv->rps.rp1_freq + dev_priv->rps.rp0_freq) >> 1 &&
+		    val < dev_priv->rps.cur_freq)
 			new_power = BETWEEN;
 		break;
 	}
@@ -4712,22 +4729,24 @@ static void gen6_set_rps_thresholds(struct drm_i915_private *dev_priv, u8 val)
 	}
 
 	I915_WRITE(GEN6_RP_UP_EI,
-		GT_INTERVAL_FROM_US(dev_priv, ei_up));
+		   GT_INTERVAL_FROM_US(dev_priv, ei_up));
 	I915_WRITE(GEN6_RP_UP_THRESHOLD,
-		GT_INTERVAL_FROM_US(dev_priv, (ei_up * threshold_up / 100)));
+		   GT_INTERVAL_FROM_US(dev_priv,
+				       ei_up * threshold_up / 100));
 
 	I915_WRITE(GEN6_RP_DOWN_EI,
-		GT_INTERVAL_FROM_US(dev_priv, ei_down));
+		   GT_INTERVAL_FROM_US(dev_priv, ei_down));
 	I915_WRITE(GEN6_RP_DOWN_THRESHOLD,
-		GT_INTERVAL_FROM_US(dev_priv, (ei_down * threshold_down / 100)));
+		   GT_INTERVAL_FROM_US(dev_priv,
+				       ei_down * threshold_down / 100));
 
-	 I915_WRITE(GEN6_RP_CONTROL,
-		    GEN6_RP_MEDIA_TURBO |
-		    GEN6_RP_MEDIA_HW_NORMAL_MODE |
-		    GEN6_RP_MEDIA_IS_GFX |
-		    GEN6_RP_ENABLE |
-		    GEN6_RP_UP_BUSY_AVG |
-		    GEN6_RP_DOWN_IDLE_AVG);
+	I915_WRITE(GEN6_RP_CONTROL,
+		   GEN6_RP_MEDIA_TURBO |
+		   GEN6_RP_MEDIA_HW_NORMAL_MODE |
+		   GEN6_RP_MEDIA_IS_GFX |
+		   GEN6_RP_ENABLE |
+		   GEN6_RP_UP_BUSY_AVG |
+		   GEN6_RP_DOWN_IDLE_AVG);
 
 	dev_priv->rps.power = new_power;
 	dev_priv->rps.up_threshold = threshold_up;
@@ -4844,6 +4863,12 @@ void gen6_rps_busy(struct drm_i915_private *dev_priv)
 			gen6_rps_reset_ei(dev_priv);
 		I915_WRITE(GEN6_PMINTRMSK,
 			   gen6_rps_pm_mask(dev_priv, dev_priv->rps.cur_freq));
+
+		/* Ensure we start at the user's desired frequency */
+		intel_set_rps(dev_priv,
+			      clamp(dev_priv->rps.cur_freq,
+				    dev_priv->rps.min_freq_softlimit,
+				    dev_priv->rps.max_freq_softlimit));
 	}
 	mutex_unlock(&dev_priv->rps.hw_lock);
 }
@@ -4954,14 +4979,15 @@ static void intel_print_rc6_info(struct drm_i915_private *dev_priv, u32 mode)
 			mode = 0;
 	}
 	if (HAS_RC6p(dev_priv))
-		DRM_DEBUG_KMS("Enabling RC6 states: RC6 %s RC6p %s RC6pp %s\n",
-			      onoff(mode & GEN6_RC_CTL_RC6_ENABLE),
-			      onoff(mode & GEN6_RC_CTL_RC6p_ENABLE),
-			      onoff(mode & GEN6_RC_CTL_RC6pp_ENABLE));
+		DRM_DEBUG_DRIVER("Enabling RC6 states: "
+				 "RC6 %s RC6p %s RC6pp %s\n",
+				 onoff(mode & GEN6_RC_CTL_RC6_ENABLE),
+				 onoff(mode & GEN6_RC_CTL_RC6p_ENABLE),
+				 onoff(mode & GEN6_RC_CTL_RC6pp_ENABLE));
 
 	else
-		DRM_DEBUG_KMS("Enabling RC6 states: RC6 %s\n",
-			      onoff(mode & GEN6_RC_CTL_RC6_ENABLE));
+		DRM_DEBUG_DRIVER("Enabling RC6 states: RC6 %s\n",
+				 onoff(mode & GEN6_RC_CTL_RC6_ENABLE));
 }
 
 static bool bxt_check_bios_rc6_setup(struct drm_i915_private *dev_priv)
@@ -4969,9 +4995,20 @@ static bool bxt_check_bios_rc6_setup(struct drm_i915_private *dev_priv)
 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
 	bool enable_rc6 = true;
 	unsigned long rc6_ctx_base;
+	u32 rc_ctl;
+	int rc_sw_target;
+
+	rc_ctl = I915_READ(GEN6_RC_CONTROL);
+	rc_sw_target = (I915_READ(GEN6_RC_STATE) & RC_SW_TARGET_STATE_MASK) >>
+		       RC_SW_TARGET_STATE_SHIFT;
+	DRM_DEBUG_DRIVER("BIOS enabled RC states: "
+			 "HW_CTRL %s HW_RC6 %s SW_TARGET_STATE %x\n",
+			 onoff(rc_ctl & GEN6_RC_CTL_HW_ENABLE),
+			 onoff(rc_ctl & GEN6_RC_CTL_RC6_ENABLE),
+			 rc_sw_target);
 
 	if (!(I915_READ(RC6_LOCATION) & RC6_CTX_IN_DRAM)) {
-		DRM_DEBUG_KMS("RC6 Base location not set properly.\n");
+		DRM_DEBUG_DRIVER("RC6 Base location not set properly.\n");
 		enable_rc6 = false;
 	}
 
@@ -4983,7 +5020,7 @@ static bool bxt_check_bios_rc6_setup(struct drm_i915_private *dev_priv)
 	if (!((rc6_ctx_base >= ggtt->stolen_reserved_base) &&
 	      (rc6_ctx_base + PAGE_SIZE <= ggtt->stolen_reserved_base +
 					ggtt->stolen_reserved_size))) {
-		DRM_DEBUG_KMS("RC6 Base address not as expected.\n");
+		DRM_DEBUG_DRIVER("RC6 Base address not as expected.\n");
 		enable_rc6 = false;
 	}
 
@@ -4991,15 +5028,24 @@ static bool bxt_check_bios_rc6_setup(struct drm_i915_private *dev_priv)
 	      ((I915_READ(PWRCTX_MAXCNT_VCSUNIT0) & IDLE_TIME_MASK) > 1) &&
 	      ((I915_READ(PWRCTX_MAXCNT_BCSUNIT) & IDLE_TIME_MASK) > 1) &&
 	      ((I915_READ(PWRCTX_MAXCNT_VECSUNIT) & IDLE_TIME_MASK) > 1))) {
-		DRM_DEBUG_KMS("Engine Idle wait time not set properly.\n");
+		DRM_DEBUG_DRIVER("Engine Idle wait time not set properly.\n");
 		enable_rc6 = false;
 	}
 
-	if (!(I915_READ(GEN6_RC_CONTROL) & (GEN6_RC_CTL_RC6_ENABLE |
-					    GEN6_RC_CTL_HW_ENABLE)) &&
-	    ((I915_READ(GEN6_RC_CONTROL) & GEN6_RC_CTL_HW_ENABLE) ||
-	     !(I915_READ(GEN6_RC_STATE) & RC6_STATE))) {
-		DRM_DEBUG_KMS("HW/SW RC6 is not enabled by BIOS.\n");
+	if (!I915_READ(GEN8_PUSHBUS_CONTROL) ||
+	    !I915_READ(GEN8_PUSHBUS_ENABLE) ||
+	    !I915_READ(GEN8_PUSHBUS_SHIFT)) {
+		DRM_DEBUG_DRIVER("Pushbus not setup properly.\n");
+		enable_rc6 = false;
+	}
+
+	if (!I915_READ(GEN6_GFXPAUSE)) {
+		DRM_DEBUG_DRIVER("GFX pause not setup properly.\n");
+		enable_rc6 = false;
+	}
+
+	if (!I915_READ(GEN8_MISC_CTRL0)) {
+		DRM_DEBUG_DRIVER("GPM control not setup properly.\n");
 		enable_rc6 = false;
 	}
 
@@ -5031,8 +5077,9 @@ int sanitize_rc6_option(struct drm_i915_private *dev_priv, int enable_rc6)
 			mask = INTEL_RC6_ENABLE;
 
 		if ((enable_rc6 & mask) != enable_rc6)
-			DRM_DEBUG_KMS("Adjusting RC6 mask to %d (requested %d, valid %d)\n",
-				      enable_rc6 & mask, enable_rc6, mask);
+			DRM_DEBUG_DRIVER("Adjusting RC6 mask to %d "
+					 "(requested %d, valid %d)\n",
+					 enable_rc6 & mask, enable_rc6, mask);
 
 		return enable_rc6 & mask;
 	}
@@ -7604,46 +7651,59 @@ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u32 mbox, u32 *val
 {
 	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
 
-	if (I915_READ(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) {
+	/* GEN6_PCODE_* are outside of the forcewake domain, we can
+	 * use te fw I915_READ variants to reduce the amount of work
+	 * required when reading/writing.
+	 */
+
+	if (I915_READ_FW(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) {
 		DRM_DEBUG_DRIVER("warning: pcode (read) mailbox access failed\n");
 		return -EAGAIN;
 	}
 
-	I915_WRITE(GEN6_PCODE_DATA, *val);
-	I915_WRITE(GEN6_PCODE_DATA1, 0);
-	I915_WRITE(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY | mbox);
+	I915_WRITE_FW(GEN6_PCODE_DATA, *val);
+	I915_WRITE_FW(GEN6_PCODE_DATA1, 0);
+	I915_WRITE_FW(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY | mbox);
 
-	if (wait_for((I915_READ(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) == 0,
-		     500)) {
+	if (intel_wait_for_register_fw(dev_priv,
+				       GEN6_PCODE_MAILBOX, GEN6_PCODE_READY, 0,
+				       500)) {
 		DRM_ERROR("timeout waiting for pcode read (%d) to finish\n", mbox);
 		return -ETIMEDOUT;
 	}
 
-	*val = I915_READ(GEN6_PCODE_DATA);
-	I915_WRITE(GEN6_PCODE_DATA, 0);
+	*val = I915_READ_FW(GEN6_PCODE_DATA);
+	I915_WRITE_FW(GEN6_PCODE_DATA, 0);
 
 	return 0;
 }
 
-int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u32 mbox, u32 val)
+int sandybridge_pcode_write(struct drm_i915_private *dev_priv,
+			       u32 mbox, u32 val)
 {
 	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
 
-	if (I915_READ(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) {
+	/* GEN6_PCODE_* are outside of the forcewake domain, we can
+	 * use te fw I915_READ variants to reduce the amount of work
+	 * required when reading/writing.
+	 */
+
+	if (I915_READ_FW(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) {
 		DRM_DEBUG_DRIVER("warning: pcode (write) mailbox access failed\n");
 		return -EAGAIN;
 	}
 
-	I915_WRITE(GEN6_PCODE_DATA, val);
-	I915_WRITE(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY | mbox);
+	I915_WRITE_FW(GEN6_PCODE_DATA, val);
+	I915_WRITE_FW(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY | mbox);
 
-	if (wait_for((I915_READ(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY) == 0,
-		     500)) {
+	if (intel_wait_for_register_fw(dev_priv,
+				       GEN6_PCODE_MAILBOX, GEN6_PCODE_READY, 0,
+				       500)) {
 		DRM_ERROR("timeout waiting for pcode write (%d) to finish\n", mbox);
 		return -ETIMEDOUT;
 	}
 
-	I915_WRITE(GEN6_PCODE_DATA, 0);
+	I915_WRITE_FW(GEN6_PCODE_DATA, 0);
 
 	return 0;
 }
@@ -7713,7 +7773,7 @@ static void __intel_rps_boost_work(struct work_struct *work)
 	struct request_boost *boost = container_of(work, struct request_boost, work);
 	struct drm_i915_gem_request *req = boost->req;
 
-	if (!i915_gem_request_completed(req, true))
+	if (!i915_gem_request_completed(req))
 		gen6_rps_boost(req->i915, NULL, req->emitted_jiffies);
 
 	i915_gem_request_unreference(req);
@@ -7727,7 +7787,7 @@ void intel_queue_rps_boost_for_request(struct drm_i915_gem_request *req)
 	if (req == NULL || INTEL_GEN(req->i915) < 6)
 		return;
 
-	if (i915_gem_request_completed(req, true))
+	if (i915_gem_request_completed(req))
 		return;
 
 	boost = kmalloc(sizeof(*boost), GFP_ATOMIC);

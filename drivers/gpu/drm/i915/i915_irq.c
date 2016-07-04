@@ -259,12 +259,12 @@ static void ilk_update_gt_irq(struct drm_i915_private *dev_priv,
 	dev_priv->gt_irq_mask &= ~interrupt_mask;
 	dev_priv->gt_irq_mask |= (~enabled_irq_mask & interrupt_mask);
 	I915_WRITE(GTIMR, dev_priv->gt_irq_mask);
-	POSTING_READ(GTIMR);
 }
 
 void gen5_enable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask)
 {
 	ilk_update_gt_irq(dev_priv, mask, mask);
+	POSTING_READ_FW(GTIMR);
 }
 
 void gen5_disable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask)
@@ -976,13 +976,11 @@ static void ironlake_rps_change_irq_handler(struct drm_i915_private *dev_priv)
 
 static void notify_ring(struct intel_engine_cs *engine)
 {
-	if (!intel_engine_initialized(engine))
-		return;
-
-	trace_i915_gem_request_notify(engine);
-	engine->user_interrupts++;
-
-	wake_up_all(&engine->irq_queue);
+	smp_store_mb(engine->irq_posted, true);
+	if (intel_engine_wakeup(engine)) {
+		trace_i915_gem_request_notify(engine);
+		engine->user_interrupts++;
+	}
 }
 
 static void vlv_c0_read(struct drm_i915_private *dev_priv,
@@ -1063,7 +1061,7 @@ static bool any_waiters(struct drm_i915_private *dev_priv)
 	struct intel_engine_cs *engine;
 
 	for_each_engine(engine, dev_priv)
-		if (engine->irq_refcount)
+		if (intel_engine_has_waiter(engine))
 			return true;
 
 	return false;
@@ -1267,8 +1265,7 @@ static void ivybridge_parity_error_irq_handler(struct drm_i915_private *dev_priv
 static void ilk_gt_irq_handler(struct drm_i915_private *dev_priv,
 			       u32 gt_iir)
 {
-	if (gt_iir &
-	    (GT_RENDER_USER_INTERRUPT | GT_RENDER_PIPECTL_NOTIFY_INTERRUPT))
+	if (gt_iir & GT_RENDER_USER_INTERRUPT)
 		notify_ring(&dev_priv->engine[RCS]);
 	if (gt_iir & ILK_BSD_USER_INTERRUPT)
 		notify_ring(&dev_priv->engine[VCS]);
@@ -1277,9 +1274,7 @@ static void ilk_gt_irq_handler(struct drm_i915_private *dev_priv,
 static void snb_gt_irq_handler(struct drm_i915_private *dev_priv,
 			       u32 gt_iir)
 {
-
-	if (gt_iir &
-	    (GT_RENDER_USER_INTERRUPT | GT_RENDER_PIPECTL_NOTIFY_INTERRUPT))
+	if (gt_iir & GT_RENDER_USER_INTERRUPT)
 		notify_ring(&dev_priv->engine[RCS]);
 	if (gt_iir & GT_BSD_USER_INTERRUPT)
 		notify_ring(&dev_priv->engine[VCS]);
@@ -2488,11 +2483,8 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
 	return ret;
 }
 
-static void i915_error_wake_up(struct drm_i915_private *dev_priv,
-			       bool reset_completed)
+static void i915_error_wake_up(struct drm_i915_private *dev_priv)
 {
-	struct intel_engine_cs *engine;
-
 	/*
 	 * Notify all waiters for GPU completion events that reset state has
 	 * been changed, and that they need to restart their wait after
@@ -2501,18 +2493,10 @@ static void i915_error_wake_up(struct drm_i915_private *dev_priv,
 	 */
 
 	/* Wake up __wait_seqno, potentially holding dev->struct_mutex. */
-	for_each_engine(engine, dev_priv)
-		wake_up_all(&engine->irq_queue);
+	wake_up_all(&dev_priv->gpu_error.wait_queue);
 
 	/* Wake up intel_crtc_wait_for_pending_flips, holding crtc->mutex. */
 	wake_up_all(&dev_priv->pending_flip_queue);
-
-	/*
-	 * Signal tasks blocked in i915_gem_wait_for_error that the pending
-	 * reset state is cleared.
-	 */
-	if (reset_completed)
-		wake_up_all(&dev_priv->gpu_error.reset_queue);
 }
 
 /**
@@ -2577,7 +2561,7 @@ static void i915_reset_and_wakeup(struct drm_i915_private *dev_priv)
 		 * Note: The wake_up also serves as a memory barrier so that
 		 * waiters see the update value of the reset counter atomic_t.
 		 */
-		i915_error_wake_up(dev_priv, true);
+		wake_up_all(&dev_priv->gpu_error.reset_queue);
 	}
 }
 
@@ -2714,7 +2698,7 @@ void i915_handle_error(struct drm_i915_private *dev_priv,
 		 * ensure that the waiters see the updated value of the reset
 		 * counter atomic_t.
 		 */
-		i915_error_wake_up(dev_priv, false);
+		i915_error_wake_up(dev_priv);
 	}
 
 	i915_reset_and_wakeup(dev_priv);
@@ -2835,9 +2819,9 @@ ring_idle(struct intel_engine_cs *engine, u32 seqno)
 }
 
 static bool
-ipehr_is_semaphore_wait(struct drm_i915_private *dev_priv, u32 ipehr)
+ipehr_is_semaphore_wait(struct intel_engine_cs *engine, u32 ipehr)
 {
-	if (INTEL_GEN(dev_priv) >= 8) {
+	if (INTEL_GEN(engine->i915) >= 8) {
 		return (ipehr >> 23) == 0x1c;
 	} else {
 		ipehr &= ~MI_SEMAPHORE_SYNC_MASK;
@@ -2908,7 +2892,7 @@ semaphore_waits_for(struct intel_engine_cs *engine, u32 *seqno)
 		return NULL;
 
 	ipehr = I915_READ(RING_IPEHR(engine->mmio_base));
-	if (!ipehr_is_semaphore_wait(engine->i915, ipehr))
+	if (!ipehr_is_semaphore_wait(engine, ipehr))
 		return NULL;
 
 	/*
@@ -2966,7 +2950,7 @@ static int semaphore_passed(struct intel_engine_cs *engine)
 	if (signaller->hangcheck.deadlock >= I915_NUM_ENGINES)
 		return -1;
 
-	if (i915_seqno_passed(signaller->get_seqno(signaller), seqno))
+	if (i915_seqno_passed(intel_engine_get_seqno(signaller), seqno))
 		return 1;
 
 	/* cursory check for an unkickable deadlock */
@@ -3085,13 +3069,11 @@ static unsigned kick_waiters(struct intel_engine_cs *engine)
 
 	if (engine->hangcheck.user_interrupts == user_interrupts &&
 	    !test_and_set_bit(engine->id, &i915->gpu_error.missed_irq_rings)) {
-		if (!(i915->gpu_error.test_irq_rings & intel_engine_flag(engine)))
+		if (!test_bit(engine->id, &i915->gpu_error.test_irq_rings))
 			DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
 				  engine->name);
-		else
-			DRM_INFO("Fake missed irq on %s\n",
-				 engine->name);
-		wake_up_all(&engine->irq_queue);
+
+		intel_engine_enable_fake_irq(engine);
 	}
 
 	return user_interrupts;
@@ -3135,10 +3117,10 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	intel_uncore_arm_unclaimed_mmio_detection(dev_priv);
 
 	for_each_engine_id(engine, dev_priv, id) {
+		bool busy = intel_engine_has_waiter(engine);
 		u64 acthd;
 		u32 seqno;
 		unsigned user_interrupts;
-		bool busy = true;
 
 		semaphore_clear_deadlocks(dev_priv);
 
@@ -3153,7 +3135,7 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 			engine->irq_seqno_barrier(engine);
 
 		acthd = intel_ring_get_active_head(engine);
-		seqno = engine->get_seqno(engine);
+		seqno = intel_engine_get_seqno(engine);
 
 		/* Reset stuck interrupts between batch advances */
 		user_interrupts = 0;
@@ -3161,12 +3143,11 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 		if (engine->hangcheck.seqno == seqno) {
 			if (ring_idle(engine, seqno)) {
 				engine->hangcheck.action = HANGCHECK_IDLE;
-				if (waitqueue_active(&engine->irq_queue)) {
+				if (busy) {
 					/* Safeguard against driver failure */
 					user_interrupts = kick_waiters(engine);
 					engine->hangcheck.score += BUSY;
-				} else
-					busy = false;
+				}
 			} else {
 				/* We always increment the hangcheck score
 				 * if the ring is busy and still processing
@@ -3240,29 +3221,12 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 		goto out;
 	}
 
+	/* Reset timer in case GPU hangs without another request being added */
 	if (busy_count)
-		/* Reset timer case chip hangs without another request
-		 * being added */
 		i915_queue_hangcheck(dev_priv);
 
 out:
 	ENABLE_RPM_WAKEREF_ASSERTS(dev_priv);
-}
-
-void i915_queue_hangcheck(struct drm_i915_private *dev_priv)
-{
-	struct i915_gpu_error *e = &dev_priv->gpu_error;
-
-	if (!i915.enable_hangcheck)
-		return;
-
-	/* Don't continually defer the hangcheck so that it is always run at
-	 * least once after work has been scheduled on any ring. Otherwise,
-	 * we will ignore a hung ring if a second ring is kept busy.
-	 */
-
-	queue_delayed_work(e->hangcheck_wq, &e->hangcheck_work,
-			   round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
 }
 
 static void ibx_irq_reset(struct drm_device *dev)
@@ -3632,8 +3596,7 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
 
 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
 	if (IS_GEN5(dev)) {
-		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
-			   ILK_BSD_USER_INTERRUPT;
+		gt_irqs |= ILK_BSD_USER_INTERRUPT;
 	} else {
 		gt_irqs |= GT_BLT_USER_INTERRUPT | GT_BSD_USER_INTERRUPT;
 	}

@@ -662,8 +662,8 @@ static int i915_gem_pageflip_info(struct seq_file *m, void *data)
 					   engine->name,
 					   i915_gem_request_get_seqno(work->flip_queued_req),
 					   dev_priv->next_seqno,
-					   engine->get_seqno(engine),
-					   i915_gem_request_completed(work->flip_queued_req, true));
+					   intel_engine_get_seqno(engine),
+					   i915_gem_request_completed(work->flip_queued_req));
 			} else
 				seq_printf(m, "Flip not associated with any ring\n");
 			seq_printf(m, "Flip queued on frame %d, (was ready on frame %d), now %d\n",
@@ -788,10 +788,22 @@ static int i915_gem_request_info(struct seq_file *m, void *data)
 static void i915_ring_seqno_info(struct seq_file *m,
 				 struct intel_engine_cs *engine)
 {
+	struct intel_breadcrumbs *b = &engine->breadcrumbs;
+	struct rb_node *rb;
+
 	seq_printf(m, "Current sequence (%s): %x\n",
-		   engine->name, engine->get_seqno(engine));
+		   engine->name, intel_engine_get_seqno(engine));
 	seq_printf(m, "Current user interrupts (%s): %x\n",
 		   engine->name, READ_ONCE(engine->user_interrupts));
+
+	spin_lock(&b->lock);
+	for (rb = rb_first(&b->waiters); rb; rb = rb_next(rb)) {
+		struct intel_wait *w = container_of(rb, typeof(*w), node);
+
+		seq_printf(m, "Waiting (%s): %s [%d] on %x\n",
+			   engine->name, w->tsk->comm, w->tsk->pid, w->seqno);
+	}
+	spin_unlock(&b->lock);
 }
 
 static int i915_gem_seqno_info(struct seq_file *m, void *data)
@@ -1408,7 +1420,7 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
 
 	for_each_engine_id(engine, dev_priv, id) {
 		acthd[id] = intel_ring_get_active_head(engine);
-		seqno[id] = engine->get_seqno(engine);
+		seqno[id] = intel_engine_get_seqno(engine);
 	}
 
 	i915_get_extra_instdone(dev_priv, instdone);
@@ -1428,6 +1440,8 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
 			   engine->hangcheck.seqno,
 			   seqno[id],
 			   engine->last_submitted_seqno);
+		seq_printf(m, "\twaiters? %d\n",
+			   intel_engine_has_waiter(engine));
 		seq_printf(m, "\tuser interrupts = %x [current %x]\n",
 			   engine->hangcheck.user_interrupts,
 			   READ_ONCE(engine->user_interrupts));
@@ -1968,19 +1982,19 @@ static int i915_gem_framebuffer_info(struct seq_file *m, void *data)
 		return ret;
 
 #ifdef CONFIG_DRM_FBDEV_EMULATION
-       if (to_i915(dev)->fbdev) {
-               fbdev_fb = to_intel_framebuffer(to_i915(dev)->fbdev->helper.fb);
+	if (to_i915(dev)->fbdev) {
+		fbdev_fb = to_intel_framebuffer(to_i915(dev)->fbdev->helper.fb);
 
-               seq_printf(m, "fbcon size: %d x %d, depth %d, %d bpp, modifier 0x%llx, refcount %d, obj ",
-                         fbdev_fb->base.width,
-                         fbdev_fb->base.height,
-                         fbdev_fb->base.depth,
-                         fbdev_fb->base.bits_per_pixel,
-                         fbdev_fb->base.modifier[0],
-                         drm_framebuffer_read_refcount(&fbdev_fb->base));
-               describe_obj(m, fbdev_fb->obj);
-               seq_putc(m, '\n');
-       }
+		seq_printf(m, "fbcon size: %d x %d, depth %d, %d bpp, modifier 0x%llx, refcount %d, obj ",
+			   fbdev_fb->base.width,
+			   fbdev_fb->base.height,
+			   fbdev_fb->base.depth,
+			   fbdev_fb->base.bits_per_pixel,
+			   fbdev_fb->base.modifier[0],
+			   drm_framebuffer_read_refcount(&fbdev_fb->base));
+		describe_obj(m, fbdev_fb->obj);
+		seq_putc(m, '\n');
+	}
 #endif
 
 	mutex_lock(&dev->mode_config.fb_lock);
@@ -2415,7 +2429,7 @@ static int count_irq_waiters(struct drm_i915_private *i915)
 	int count = 0;
 
 	for_each_engine(engine, i915)
-		count += engine->irq_refcount;
+		count += intel_engine_has_waiter(engine);
 
 	return count;
 }
@@ -2544,9 +2558,9 @@ static void i915_guc_client_info(struct seq_file *m,
 
 	for_each_engine(engine, dev_priv) {
 		seq_printf(m, "\tSubmissions: %llu %s\n",
-				client->submissions[engine->guc_id],
+				client->submissions[engine->id],
 				engine->name);
-		tot += client->submissions[engine->guc_id];
+		tot += client->submissions[engine->id];
 	}
 	seq_printf(m, "\tTotal: %llu\n", tot);
 }
@@ -2587,9 +2601,9 @@ static int i915_guc_info(struct seq_file *m, void *data)
 	seq_printf(m, "\nGuC submissions:\n");
 	for_each_engine(engine, dev_priv) {
 		seq_printf(m, "\t%-24s: %10llu, last seqno 0x%08x\n",
-			engine->name, guc.submissions[engine->guc_id],
-			guc.last_seqno[engine->guc_id]);
-		total += guc.submissions[engine->guc_id];
+			engine->name, guc.submissions[engine->id],
+			guc.last_seqno[engine->id]);
+		total += guc.submissions[engine->id];
 	}
 	seq_printf(m, "\t%s: %llu\n", "Total", total);
 
@@ -2701,7 +2715,6 @@ static int i915_sink_crc(struct seq_file *m, void *data)
 {
 	struct drm_info_node *node = m->private;
 	struct drm_device *dev = node->minor->dev;
-	struct intel_encoder *encoder;
 	struct intel_connector *connector;
 	struct intel_dp *intel_dp = NULL;
 	int ret;
@@ -2709,18 +2722,19 @@ static int i915_sink_crc(struct seq_file *m, void *data)
 
 	drm_modeset_lock_all(dev);
 	for_each_intel_connector(dev, connector) {
+		struct drm_crtc *crtc;
 
-		if (connector->base.dpms != DRM_MODE_DPMS_ON)
+		if (!connector->base.state->best_encoder)
 			continue;
 
-		if (!connector->base.encoder)
+		crtc = connector->base.state->crtc;
+		if (!crtc->state->active)
 			continue;
 
-		encoder = to_intel_encoder(connector->base.encoder);
-		if (encoder->type != INTEL_OUTPUT_EDP)
+		if (connector->base.connector_type != DRM_MODE_CONNECTOR_eDP)
 			continue;
 
-		intel_dp = enc_to_intel_dp(&encoder->base);
+		intel_dp = enc_to_intel_dp(connector->base.state->best_encoder);
 
 		ret = intel_dp_sink_crc(intel_dp, crc);
 		if (ret)
@@ -2950,7 +2964,7 @@ static void intel_dp_info(struct seq_file *m,
 
 	seq_printf(m, "\tDPCD rev: %x\n", intel_dp->dpcd[DP_DPCD_REV]);
 	seq_printf(m, "\taudio support: %s\n", yesno(intel_dp->has_audio));
-	if (intel_encoder->type == INTEL_OUTPUT_EDP)
+	if (intel_connector->base.connector_type == DRM_MODE_CONNECTOR_eDP)
 		intel_panel_info(m, &intel_connector->panel);
 }
 
@@ -2989,14 +3003,26 @@ static void intel_connector_info(struct seq_file *m,
 		seq_printf(m, "\tCEA rev: %d\n",
 			   connector->display_info.cea_rev);
 	}
-	if (intel_encoder) {
-		if (intel_encoder->type == INTEL_OUTPUT_DISPLAYPORT ||
-		    intel_encoder->type == INTEL_OUTPUT_EDP)
-			intel_dp_info(m, intel_connector);
-		else if (intel_encoder->type == INTEL_OUTPUT_HDMI)
-			intel_hdmi_info(m, intel_connector);
-		else if (intel_encoder->type == INTEL_OUTPUT_LVDS)
+
+	if (!intel_encoder || intel_encoder->type == INTEL_OUTPUT_DP_MST)
+		return;
+
+	switch (connector->connector_type) {
+	case DRM_MODE_CONNECTOR_DisplayPort:
+	case DRM_MODE_CONNECTOR_eDP:
+		intel_dp_info(m, intel_connector);
+		break;
+	case DRM_MODE_CONNECTOR_LVDS:
+		if (intel_encoder->type == INTEL_OUTPUT_LVDS)
 			intel_lvds_info(m, intel_connector);
+		break;
+	case DRM_MODE_CONNECTOR_HDMIA:
+		if (intel_encoder->type == INTEL_OUTPUT_HDMI ||
+		    intel_encoder->type == INTEL_OUTPUT_UNKNOWN)
+			intel_hdmi_info(m, intel_connector);
+		break;
+	default:
+		break;
 	}
 
 	seq_printf(m, "\tmodes:\n");
@@ -3374,31 +3400,16 @@ static int i915_ddb_info(struct seq_file *m, void *unused)
 static void drrs_status_per_crtc(struct seq_file *m,
 		struct drm_device *dev, struct intel_crtc *intel_crtc)
 {
-	struct intel_encoder *intel_encoder;
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct i915_drrs *drrs = &dev_priv->drrs;
 	int vrefresh = 0;
+	struct drm_connector *connector;
 
-	for_each_encoder_on_crtc(dev, &intel_crtc->base, intel_encoder) {
-		/* Encoder connected on this CRTC */
-		switch (intel_encoder->type) {
-		case INTEL_OUTPUT_EDP:
-			seq_puts(m, "eDP:\n");
-			break;
-		case INTEL_OUTPUT_DSI:
-			seq_puts(m, "DSI:\n");
-			break;
-		case INTEL_OUTPUT_HDMI:
-			seq_puts(m, "HDMI:\n");
-			break;
-		case INTEL_OUTPUT_DISPLAYPORT:
-			seq_puts(m, "DP:\n");
-			break;
-		default:
-			seq_printf(m, "Other encoder (id=%d).\n",
-						intel_encoder->type);
-			return;
-		}
+	drm_for_each_connector(connector, dev) {
+		if (connector->state->crtc != &intel_crtc->base)
+			continue;
+
+		seq_printf(m, "%s:\n", connector->name);
 	}
 
 	if (dev_priv->vbt.drrs_type == STATIC_DRRS_SUPPORT)
@@ -3461,18 +3472,16 @@ static int i915_drrs_status(struct seq_file *m, void *unused)
 	struct intel_crtc *intel_crtc;
 	int active_crtc_cnt = 0;
 
+	drm_modeset_lock_all(dev);
 	for_each_intel_crtc(dev, intel_crtc) {
-		drm_modeset_lock(&intel_crtc->base.mutex, NULL);
-
 		if (intel_crtc->base.state->active) {
 			active_crtc_cnt++;
 			seq_printf(m, "\nCRTC %d:  ", active_crtc_cnt);
 
 			drrs_status_per_crtc(m, dev, intel_crtc);
 		}
-
-		drm_modeset_unlock(&intel_crtc->base.mutex);
 	}
+	drm_modeset_unlock_all(dev);
 
 	if (!active_crtc_cnt)
 		seq_puts(m, "No active crtc found\n");
@@ -3490,17 +3499,23 @@ static int i915_dp_mst_info(struct seq_file *m, void *unused)
 {
 	struct drm_info_node *node = (struct drm_info_node *) m->private;
 	struct drm_device *dev = node->minor->dev;
-	struct drm_encoder *encoder;
 	struct intel_encoder *intel_encoder;
 	struct intel_digital_port *intel_dig_port;
+	struct drm_connector *connector;
+
 	drm_modeset_lock_all(dev);
-	list_for_each_entry(encoder, &dev->mode_config.encoder_list, head) {
-		intel_encoder = to_intel_encoder(encoder);
-		if (intel_encoder->type != INTEL_OUTPUT_DISPLAYPORT)
+	drm_for_each_connector(connector, dev) {
+		if (connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort)
 			continue;
-		intel_dig_port = enc_to_dig_port(encoder);
+
+		intel_encoder = intel_attached_encoder(connector);
+		if (!intel_encoder || intel_encoder->type == INTEL_OUTPUT_DP_MST)
+			continue;
+
+		intel_dig_port = enc_to_dig_port(&intel_encoder->base);
 		if (!intel_dig_port->dp.can_mst)
 			continue;
+
 		seq_printf(m, "MST Source Port %c\n",
 			   port_name(intel_dig_port->port));
 		drm_dp_mst_dump_topology(m, &intel_dig_port->dp.mst_mgr);
@@ -4946,7 +4961,7 @@ i915_drop_caches_set(void *data, u64 val)
 		return ret;
 
 	if (val & DROP_ACTIVE) {
-		ret = i915_gpu_idle(dev);
+		ret = i915_gem_wait_for_idle(dev_priv);
 		if (ret)
 			goto unlock;
 	}
@@ -5507,8 +5522,9 @@ void intel_display_crc_init(struct drm_device *dev)
 	}
 }
 
-int i915_debugfs_init(struct drm_minor *minor)
+int i915_debugfs_register(struct drm_i915_private *dev_priv)
 {
+	struct drm_minor *minor = dev_priv->dev->primary;
 	int ret, i;
 
 	ret = i915_forcewake_create(minor->debugfs_root, minor);
@@ -5534,8 +5550,9 @@ int i915_debugfs_init(struct drm_minor *minor)
 					minor->debugfs_root, minor);
 }
 
-void i915_debugfs_cleanup(struct drm_minor *minor)
+void i915_debugfs_unregister(struct drm_i915_private *dev_priv)
 {
+	struct drm_minor *minor = dev_priv->dev->primary;
 	int i;
 
 	drm_debugfs_remove_files(i915_debugfs_list,

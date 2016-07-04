@@ -508,7 +508,7 @@ int i915_gem_obj_prepare_shmem_read(struct drm_i915_gem_object *obj,
 
 	*needs_clflush = 0;
 
-	if (WARN_ON((obj->ops->flags & I915_GEM_OBJECT_HAS_STRUCT_PAGE) == 0))
+	if (WARN_ON(!i915_gem_object_has_struct_page(obj)))
 		return -EINVAL;
 
 	if (!(obj->base.read_domains & I915_GEM_DOMAIN_CPU)) {
@@ -760,7 +760,7 @@ i915_gem_shmem_pread(struct drm_device *dev,
 	int needs_clflush = 0;
 	struct sg_page_iter sg_iter;
 
-	if (!obj->base.filp)
+	if (!i915_gem_object_has_struct_page(obj))
 		return -ENODEV;
 
 	user_data = u64_to_user_ptr(args->data_ptr);
@@ -1298,7 +1298,8 @@ i915_gem_pwrite_ioctl(struct drm_device *dev, void *data,
 	 * pread/pwrite currently are reading and writing from the CPU
 	 * perspective, requiring manual detiling by the client.
 	 */
-	if (!obj->base.filp || cpu_write_needs_clflush(obj)) {
+	if (!i915_gem_object_has_struct_page(obj) ||
+	    cpu_write_needs_clflush(obj)) {
 		ret = i915_gem_gtt_pwrite_fast(dev_priv, obj, args, file);
 		/* Note that the gtt paths might fail with non-page-backed user
 		 * pointers (e.g. gtt mappings when moving data between
@@ -1308,7 +1309,7 @@ i915_gem_pwrite_ioctl(struct drm_device *dev, void *data,
 	if (ret == -EFAULT) {
 		if (obj->phys_handle)
 			ret = i915_gem_phys_pwrite(obj, args, file);
-		else if (obj->base.filp)
+		else if (i915_gem_object_has_struct_page(obj))
 			ret = i915_gem_shmem_pwrite(dev, obj, args, file);
 		else
 			ret = -ENODEV;
@@ -1340,17 +1341,6 @@ i915_gem_check_wedge(unsigned reset_counter, bool interruptible)
 	}
 
 	return 0;
-}
-
-static void fake_irq(unsigned long data)
-{
-	wake_up_process((struct task_struct *)data);
-}
-
-static bool missed_irq(struct drm_i915_private *dev_priv,
-		       struct intel_engine_cs *engine)
-{
-	return test_bit(engine->id, &dev_priv->gpu_error.missed_irq_rings);
 }
 
 static unsigned long local_clock_us(unsigned *cpu)
@@ -1385,9 +1375,9 @@ static bool busywait_stop(unsigned long timeout, unsigned cpu)
 	return this_cpu != cpu;
 }
 
-static int __i915_spin_request(struct drm_i915_gem_request *req, int state)
+bool __i915_spin_request(const struct drm_i915_gem_request *req,
+			 int state, unsigned long timeout_us)
 {
-	unsigned long timeout;
 	unsigned cpu;
 
 	/* When waiting for high frequency requests, e.g. during synchronous
@@ -1400,31 +1390,21 @@ static int __i915_spin_request(struct drm_i915_gem_request *req, int state)
 	 * takes to sleep on a request, on the order of a microsecond.
 	 */
 
-	if (req->engine->irq_refcount)
-		return -EBUSY;
-
-	/* Only spin if we know the GPU is processing this request */
-	if (!i915_gem_request_started(req, true))
-		return -EAGAIN;
-
-	timeout = local_clock_us(&cpu) + 5;
-	while (!need_resched()) {
-		if (i915_gem_request_completed(req, true))
-			return 0;
+	timeout_us += local_clock_us(&cpu);
+	do {
+		if (i915_gem_request_completed(req))
+			return true;
 
 		if (signal_pending_state(state, current))
 			break;
 
-		if (busywait_stop(timeout, cpu))
+		if (busywait_stop(timeout_us, cpu))
 			break;
 
 		cpu_relax_lowlatency();
-	}
+	} while (!need_resched());
 
-	if (i915_gem_request_completed(req, false))
-		return 0;
-
-	return -EAGAIN;
+	return false;
 }
 
 /**
@@ -1449,25 +1429,22 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 			s64 *timeout,
 			struct intel_rps_client *rps)
 {
-	struct intel_engine_cs *engine = i915_gem_request_get_engine(req);
-	struct drm_i915_private *dev_priv = req->i915;
-	const bool irq_test_in_progress =
-		ACCESS_ONCE(dev_priv->gpu_error.test_irq_rings) & intel_engine_flag(engine);
 	int state = interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE;
-	DEFINE_WAIT(wait);
-	unsigned long timeout_expire;
+	DEFINE_WAIT(reset);
+	struct intel_wait wait;
+	unsigned long timeout_remain;
 	s64 before = 0; /* Only to silence a compiler warning. */
-	int ret;
+	int ret = 0;
 
-	WARN(!intel_irqs_enabled(dev_priv), "IRQs disabled");
+	might_sleep();
 
 	if (list_empty(&req->list))
 		return 0;
 
-	if (i915_gem_request_completed(req, true))
+	if (i915_gem_request_completed(req))
 		return 0;
 
-	timeout_expire = 0;
+	timeout_remain = MAX_SCHEDULE_TIMEOUT;
 	if (timeout) {
 		if (WARN_ON(*timeout < 0))
 			return -EINVAL;
@@ -1475,7 +1452,7 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 		if (*timeout == 0)
 			return -ETIME;
 
-		timeout_expire = jiffies + nsecs_to_jiffies_timeout(*timeout);
+		timeout_remain = nsecs_to_jiffies_timeout(*timeout);
 
 		/*
 		 * Record current time in case interrupted by signal, or wedged.
@@ -1483,75 +1460,70 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 		before = ktime_get_raw_ns();
 	}
 
-	if (INTEL_INFO(dev_priv)->gen >= 6)
-		gen6_rps_boost(dev_priv, rps, req->emitted_jiffies);
-
 	trace_i915_gem_request_wait_begin(req);
 
-	/* Optimistic spin for the next jiffie before touching IRQs */
-	ret = __i915_spin_request(req, state);
-	if (ret == 0)
-		goto out;
+	if (INTEL_INFO(req->i915)->gen >= 6)
+		gen6_rps_boost(req->i915, rps, req->emitted_jiffies);
 
-	if (!irq_test_in_progress && WARN_ON(!engine->irq_get(engine))) {
-		ret = -ENODEV;
-		goto out;
-	}
+	/* Optimistic spin for the next ~jiffie before touching IRQs */
+	if (i915_spin_request(req, state, 5))
+		goto complete;
+
+	set_current_state(state);
+	add_wait_queue(&req->i915->gpu_error.wait_queue, &reset);
+
+	intel_wait_init(&wait, req->seqno);
+	if (intel_engine_add_wait(req->engine, &wait))
+		/* In order to check that we haven't missed the interrupt
+		 * as we enabled it, we need to kick ourselves to do a
+		 * coherent check on the seqno before we sleep.
+		 */
+		goto wakeup;
 
 	for (;;) {
-		struct timer_list timer;
-
-		prepare_to_wait(&engine->irq_queue, &wait, state);
-
-		/* We need to check whether any gpu reset happened in between
-		 * the request being submitted and now. If a reset has occurred,
-		 * the request is effectively complete (we either are in the
-		 * process of or have discarded the rendering and completely
-		 * reset the GPU. The results of the request are lost and we
-		 * are free to continue on with the original operation.
-		 */
-		if (req->reset_counter != i915_reset_counter(&dev_priv->gpu_error)) {
-			ret = 0;
-			break;
-		}
-
-		if (i915_gem_request_completed(req, false)) {
-			ret = 0;
-			break;
-		}
-
 		if (signal_pending_state(state, current)) {
 			ret = -ERESTARTSYS;
 			break;
 		}
 
-		if (timeout && time_after_eq(jiffies, timeout_expire)) {
+		/* Ensure that even if the GPU hangs, we get woken up.
+		 *
+		 * However, note that if no one is waiting, we never notice
+		 * a gpu hang. Eventually, we will have to wait for a resource
+		 * held by the GPU and so trigger a hangcheck. In the most
+		 * pathological case, this will be upon memory starvation!
+		 */
+		i915_queue_hangcheck(req->i915);
+
+		timeout_remain = io_schedule_timeout(timeout_remain);
+		if (timeout_remain == 0) {
 			ret = -ETIME;
 			break;
 		}
 
-		timer.function = NULL;
-		if (timeout || missed_irq(dev_priv, engine)) {
-			unsigned long expire;
+		if (intel_wait_complete(&wait))
+			break;
 
-			setup_timer_on_stack(&timer, fake_irq, (unsigned long)current);
-			expire = missed_irq(dev_priv, engine) ? jiffies + 1 : timeout_expire;
-			mod_timer(&timer, expire);
-		}
+		set_current_state(state);
 
-		io_schedule();
+wakeup:
+		/* Carefully check if the request is complete, giving time
+		 * for the seqno to be visible following the interrupt.
+		 * We also have to check in case we are kicked by the GPU
+		 * reset in order to drop the struct_mutex.
+		 */
+		if (__i915_request_irq_complete(req))
+			break;
 
-		if (timer.function) {
-			del_singleshot_timer_sync(&timer);
-			destroy_timer_on_stack(&timer);
-		}
+		/* Only spin if we know the GPU is processing this request */
+		if (i915_spin_request(req, state, 2))
+			break;
 	}
-	if (!irq_test_in_progress)
-		engine->irq_put(engine);
+	remove_wait_queue(&req->i915->gpu_error.wait_queue, &reset);
 
-	finish_wait(&engine->irq_queue, &wait);
-
-out:
+	intel_engine_remove_wait(req->engine, &wait);
+	__set_current_state(TASK_RUNNING);
+complete:
 	trace_i915_gem_request_wait_end(req);
 
 	if (timeout) {
@@ -1684,7 +1656,7 @@ i915_wait_request(struct drm_i915_gem_request *req)
 		return ret;
 
 	/* If the GPU hung, we want to keep the requests to find the guilty. */
-	if (req->reset_counter == i915_reset_counter(&dev_priv->gpu_error))
+	if (!i915_reset_in_progress(&dev_priv->gpu_error))
 		__i915_gem_request_retire__upto(req);
 
 	return 0;
@@ -1745,7 +1717,7 @@ i915_gem_object_retire_request(struct drm_i915_gem_object *obj,
 	else if (obj->last_write_req == req)
 		i915_gem_object_retire__write(obj);
 
-	if (req->reset_counter == i915_reset_counter(&req->i915->gpu_error))
+	if (!i915_reset_in_progress(&req->i915->gpu_error))
 		__i915_gem_request_retire__upto(req);
 }
 
@@ -1809,6 +1781,13 @@ static struct intel_rps_client *to_rps_client(struct drm_file *file)
 	return &fpriv->rps;
 }
 
+static enum fb_op_origin
+write_origin(struct drm_i915_gem_object *obj, unsigned domain)
+{
+	return domain == I915_GEM_DOMAIN_GTT && !obj->has_wc_mmap ?
+	       ORIGIN_GTT : ORIGIN_CPU;
+}
+
 /**
  * Called when user space prepares to use an object with the CPU, either
  * through the mmap ioctl's mapping or a GTT mapping.
@@ -1865,9 +1844,7 @@ i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
 		ret = i915_gem_object_set_to_cpu_domain(obj, write_domain != 0);
 
 	if (write_domain != 0)
-		intel_fb_obj_invalidate(obj,
-					write_domain == I915_GEM_DOMAIN_GTT ?
-					ORIGIN_GTT : ORIGIN_CPU);
+		intel_fb_obj_invalidate(obj, write_origin(obj, write_domain));
 
 unref:
 	drm_gem_object_unreference(&obj->base);
@@ -1974,6 +1951,9 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
 		else
 			addr = -ENOMEM;
 		up_write(&mm->mmap_sem);
+
+		/* This may race, but that's ok, it only gets set */
+		WRITE_ONCE(to_intel_bo(obj)->has_wc_mmap, true);
 	}
 	drm_gem_object_unreference_unlocked(obj);
 	if (IS_ERR((void *)addr))
@@ -2773,6 +2753,13 @@ i915_gem_init_seqno(struct drm_i915_private *dev_priv, u32 seqno)
 	}
 	i915_gem_retire_requests(dev_priv);
 
+	/* If the seqno wraps around, we need to clear the breadcrumb rbtree */
+	if (!i915_seqno_passed(seqno, dev_priv->next_seqno)) {
+		while (intel_kick_waiters(dev_priv) ||
+		       intel_kick_signalers(dev_priv))
+			yield();
+	}
+
 	/* Finally reset hw state */
 	for_each_engine(engine, dev_priv)
 		intel_ring_init_seqno(engine, seqno);
@@ -2909,8 +2896,6 @@ void __i915_add_request(struct drm_i915_gem_request *request,
 	/* Not allowed to fail! */
 	WARN(ret, "emit|add_request failed: %d!\n", ret);
 
-	i915_queue_hangcheck(engine->i915);
-
 	queue_delayed_work(dev_priv->wq,
 			   &dev_priv->mm.retire_work,
 			   round_jiffies_up_relative(HZ));
@@ -3012,7 +2997,6 @@ __i915_gem_request_alloc(struct intel_engine_cs *engine,
 	kref_init(&req->ref);
 	req->i915 = dev_priv;
 	req->engine = engine;
-	req->reset_counter = reset_counter;
 	req->ctx  = ctx;
 	i915_gem_context_reference(req->ctx);
 
@@ -3072,8 +3056,16 @@ i915_gem_find_active_request(struct intel_engine_cs *engine)
 {
 	struct drm_i915_gem_request *request;
 
+	/* We are called by the error capture and reset at a random
+	 * point in time. In particular, note that neither is crucially
+	 * ordered with an interrupt. After a hang, the GPU is dead and we
+	 * assume that no more writes can happen (we waited long enough for
+	 * all writes that were in transaction to be flushed) - adding an
+	 * extra delay for a recent interrupt is pointless. Hence, we do
+	 * not need an engine->irq_seqno_barrier() before the seqno reads.
+	 */
 	list_for_each_entry(request, &engine->request_list, list) {
-		if (i915_gem_request_completed(request, false))
+		if (i915_gem_request_completed(request))
 			continue;
 
 		return request;
@@ -3205,7 +3197,7 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *engine)
 					   struct drm_i915_gem_request,
 					   list);
 
-		if (!i915_gem_request_completed(request, true))
+		if (!i915_gem_request_completed(request))
 			break;
 
 		i915_gem_request_retire(request);
@@ -3226,12 +3218,6 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *engine)
 			break;
 
 		i915_gem_object_retire__read(obj, engine->id);
-	}
-
-	if (unlikely(engine->trace_irq_req &&
-		     i915_gem_request_completed(engine->trace_irq_req, true))) {
-		engine->irq_put(engine);
-		i915_gem_request_assign(&engine->trace_irq_req, NULL);
 	}
 
 	WARN_ON(i915_verify_lists(engine->dev));
@@ -3255,8 +3241,8 @@ i915_gem_retire_requests(struct drm_i915_private *dev_priv)
 
 	if (idle)
 		mod_delayed_work(dev_priv->wq,
-				   &dev_priv->mm.idle_work,
-				   msecs_to_jiffies(100));
+				 &dev_priv->mm.idle_work,
+				 msecs_to_jiffies(100));
 
 	return idle;
 }
@@ -3327,7 +3313,7 @@ i915_gem_object_flush_active(struct drm_i915_gem_object *obj)
 		if (req == NULL)
 			continue;
 
-		if (i915_gem_request_completed(req, true))
+		if (i915_gem_request_completed(req))
 			i915_gem_object_retire__read(obj, i);
 	}
 
@@ -3435,7 +3421,7 @@ __i915_gem_object_sync(struct drm_i915_gem_object *obj,
 	if (to == from)
 		return 0;
 
-	if (i915_gem_request_completed(from_req, true))
+	if (i915_gem_request_completed(from_req))
 		return 0;
 
 	if (!i915_semaphore_is_enabled(to_i915(obj->base.dev))) {
@@ -3662,26 +3648,16 @@ int __i915_vma_unbind_no_wait(struct i915_vma *vma)
 	return __i915_vma_unbind(vma, false);
 }
 
-int i915_gpu_idle(struct drm_device *dev)
+int i915_gem_wait_for_idle(struct drm_i915_private *dev_priv)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct intel_engine_cs *engine;
 	int ret;
 
-	/* Flush everything onto the inactive list. */
+	lockdep_assert_held(&dev_priv->dev->struct_mutex);
+
 	for_each_engine(engine, dev_priv) {
-		if (!i915.enable_execlists) {
-			struct drm_i915_gem_request *req;
-
-			req = i915_gem_request_alloc(engine, NULL);
-			if (IS_ERR(req))
-				return PTR_ERR(req);
-
-			ret = i915_switch_context(req);
-			i915_add_request_no_flush(req);
-			if (ret)
-				return ret;
-		}
+		if (engine->last_context == NULL)
+			continue;
 
 		ret = intel_engine_idle(engine);
 		if (ret)
@@ -4952,7 +4928,7 @@ i915_gem_suspend(struct drm_device *dev)
 	int ret = 0;
 
 	mutex_lock(&dev->struct_mutex);
-	ret = i915_gpu_idle(dev);
+	ret = i915_gem_wait_for_idle(dev_priv);
 	if (ret)
 		goto err;
 
@@ -5138,12 +5114,6 @@ i915_gem_init_hw(struct drm_device *dev)
 	if (ret)
 		goto out;
 
-	/*
-	 * Increment the next seqno by 0x100 so we have a visible break
-	 * on re-initialisation
-	 */
-	ret = i915_gem_set_seqno(dev, dev_priv->next_seqno+0x100);
-
 out:
 	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
 	return ret;
@@ -5281,17 +5251,10 @@ i915_gem_load_init(struct drm_device *dev)
 			  i915_gem_retire_work_handler);
 	INIT_DELAYED_WORK(&dev_priv->mm.idle_work,
 			  i915_gem_idle_work_handler);
+	init_waitqueue_head(&dev_priv->gpu_error.wait_queue);
 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
 
 	dev_priv->relative_constants_mode = I915_EXEC_CONSTANTS_REL_GENERAL;
-
-	/*
-	 * Set initial sequence number for requests.
-	 * Using this number allows the wraparound to happen early,
-	 * catching any obvious problems.
-	 */
-	dev_priv->next_seqno = ((u32)~0 - 0x1100);
-	dev_priv->last_seqno = ((u32)~0 - 0x1101);
 
 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
 
@@ -5528,7 +5491,7 @@ i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj, int n)
 	struct page *page;
 
 	/* Only default objects have per-page dirty tracking */
-	if (WARN_ON((obj->ops->flags & I915_GEM_OBJECT_HAS_STRUCT_PAGE) == 0))
+	if (WARN_ON(!i915_gem_object_has_struct_page(obj)))
 		return NULL;
 
 	page = i915_gem_object_get_page(obj, n);
