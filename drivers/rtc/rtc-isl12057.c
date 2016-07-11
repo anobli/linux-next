@@ -264,36 +264,6 @@ static int isl12057_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 	alarm_tm->tm_min  = bcd2bin(regs[1] & 0x7f);
 	alarm_tm->tm_hour = bcd2bin(regs[2] & 0x3f);
 	alarm_tm->tm_mday = bcd2bin(regs[3] & 0x3f);
-	alarm_tm->tm_wday = -1;
-
-	/*
-	 * The alarm section does not store year/month. We use the ones in rtc
-	 * section as a basis and increment month and then year if needed to get
-	 * alarm after current time.
-	 */
-	ret = _isl12057_rtc_read_time(dev, &rtc_tm);
-	if (ret)
-		goto err_unlock;
-
-	alarm_tm->tm_year = rtc_tm.tm_year;
-	alarm_tm->tm_mon = rtc_tm.tm_mon;
-
-	ret = rtc_tm_to_time(&rtc_tm, &rtc_secs);
-	if (ret)
-		goto err_unlock;
-
-	ret = rtc_tm_to_time(alarm_tm, &alarm_secs);
-	if (ret)
-		goto err_unlock;
-
-	if (alarm_secs < rtc_secs) {
-		if (alarm_tm->tm_mon == 11) {
-			alarm_tm->tm_mon = 0;
-			alarm_tm->tm_year += 1;
-		} else {
-			alarm_tm->tm_mon += 1;
-		}
-	}
 
 	ret = regmap_read(data->regmap, ISL12057_REG_INT, &ir);
 	if (ret) {
