@@ -157,22 +157,17 @@ static int get_burstcount(struct tpm_chip *chip)
 	struct tpm_tis_data *priv = dev_get_drvdata(&chip->dev);
 	unsigned long stop;
 	int burstcnt, rc;
-	u8 value;
+	u32 value;
 
 	/* wait for burstcount */
 	/* which timeout value, spec has 2 answers (c & d) */
 	stop = jiffies + chip->timeout_d;
 	do {
-		rc = tpm_tis_read8(priv, TPM_STS(priv->locality) + 1, &value);
+		rc = tpm_tis_read32(priv, TPM_STS(priv->locality), &value);
 		if (rc < 0)
 			return rc;
 
-		burstcnt = value;
-		rc = tpm_tis_read8(priv, TPM_STS(priv->locality) + 2, &value);
-		if (rc < 0)
-			return rc;
-
-		burstcnt += value << 8;
+		burstcnt = (value >> 8) & 0xFFFF;
 		if (burstcnt)
 			return burstcnt;
 		msleep(TPM_TIMEOUT);
@@ -643,6 +638,7 @@ void tpm_tis_remove(struct tpm_chip *chip)
 EXPORT_SYMBOL_GPL(tpm_tis_remove);
 
 static const struct tpm_class_ops tpm_tis = {
+	.flags = TPM_OPS_AUTO_STARTUP,
 	.status = tpm_tis_status,
 	.recv = tpm_tis_recv,
 	.send = tpm_tis_send,
@@ -671,10 +667,10 @@ int tpm_tis_core_init(struct device *dev, struct tpm_tis_data *priv, int irq,
 #endif
 
 	/* Maximum timeouts */
-	chip->timeout_a = TIS_TIMEOUT_A_MAX;
-	chip->timeout_b = TIS_TIMEOUT_B_MAX;
-	chip->timeout_c = TIS_TIMEOUT_C_MAX;
-	chip->timeout_d = TIS_TIMEOUT_D_MAX;
+	chip->timeout_a = msecs_to_jiffies(TIS_TIMEOUT_A_MAX);
+	chip->timeout_b = msecs_to_jiffies(TIS_TIMEOUT_B_MAX);
+	chip->timeout_c = msecs_to_jiffies(TIS_TIMEOUT_C_MAX);
+	chip->timeout_d = msecs_to_jiffies(TIS_TIMEOUT_D_MAX);
 	priv->phy_ops = phy_ops;
 	dev_set_drvdata(&chip->dev, priv);
 
@@ -775,29 +771,6 @@ int tpm_tis_core_init(struct device *dev, struct tpm_tis_data *priv, int irq,
 					"TPM interrupt not working, polling instead\n");
 		} else {
 			tpm_tis_probe_irq(chip, intmask);
-		}
-	}
-
-	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
-		rc = tpm2_do_selftest(chip);
-		if (rc == TPM2_RC_INITIALIZE) {
-			dev_warn(dev, "Firmware has not started TPM\n");
-			rc  = tpm2_startup(chip, TPM2_SU_CLEAR);
-			if (!rc)
-				rc = tpm2_do_selftest(chip);
-		}
-
-		if (rc) {
-			dev_err(dev, "TPM self test failed\n");
-			if (rc > 0)
-				rc = -ENODEV;
-			goto out_err;
-		}
-	} else {
-		if (tpm_do_selftest(chip)) {
-			dev_err(dev, "TPM self test failed\n");
-			rc = -ENODEV;
-			goto out_err;
 		}
 	}
 
