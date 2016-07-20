@@ -1,0 +1,13 @@
+Importing jdelvare-hwmon based on 4.6
+Unchanged quilt series jdelvare-hwmon
+Importing dmi based on 08d27eb2066622cd659b91d877d0406ebd651225
+$ git clone -s -l -n -q . ../quilt-tmp
+$ cd ../quilt-tmp
+$ git reset --hard 08d27eb2066622cd659b91d877d0406ebd651225
+HEAD is now at 08d27eb20666 Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/viro/vfs
+$ git am --patch-format=mbox ../quilt/dmi/dmi-id-01-dont-free-dev-structure-after-register.patch
+Applying: dmi-id: don't free dev structure after calling device_register
+$ cd /home/sfr/kernels/next/next
+$ git fetch -f ../quilt-tmp master:dmi/master
+From ../quilt-tmp
+ + c3db05ecf8ac...0deb6b2c087a master     -> dmi/master  (forced update)
