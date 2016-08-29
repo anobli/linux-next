@@ -203,7 +203,6 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
 }
 
 /* Fill in the fpu structure for a core dump.  */
-#ifdef CONFIG_FPU
 int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 {
 	char fpustate[216];
@@ -222,6 +221,7 @@ int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 		return 1;
 	}
 
+#ifdef CONFIG_FPU
 	/* First dump the fpu context to avoid protocol violation.  */
 	asm volatile ("fsave %0" :: "m" (fpustate[0]) : "memory");
 	if (!CPU_IS_060 ? !fpustate[0] : !fpustate[2])
@@ -248,11 +248,11 @@ int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 			      : "m" (fpu->fpregs[0])
 			      : "memory");
 	}
+#endif /* CONFIG_FPU */
 
 	return 1;
 }
 EXPORT_SYMBOL(dump_fpu);
-#endif /* CONFIG_FPU */
 
 unsigned long get_wchan(struct task_struct *p)
 {
