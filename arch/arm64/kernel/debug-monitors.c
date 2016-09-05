@@ -132,36 +132,18 @@ NOKPROBE_SYMBOL(disable_debug_monitors);
 /*
  * OS lock clearing.
  */
-static void clear_os_lock(void *unused)
+static int clear_os_lock(unsigned int cpu)
 {
 	asm volatile("msr oslar_el1, %0" : : "r" (0));
+	isb();
+	return 0;
 }
-
-static int os_lock_notify(struct notifier_block *self,
-				    unsigned long action, void *data)
-{
-	if ((action & ~CPU_TASKS_FROZEN) == CPU_ONLINE)
-		clear_os_lock(NULL);
-	return NOTIFY_OK;
-}
-
-static struct notifier_block os_lock_nb = {
-	.notifier_call = os_lock_notify,
-};
 
 static int debug_monitors_init(void)
 {
-	cpu_notifier_register_begin();
-
-	/* Clear the OS lock. */
-	on_each_cpu(clear_os_lock, NULL, 1);
-	isb();
-
-	/* Register hotplug handler. */
-	__register_cpu_notifier(&os_lock_nb);
-
-	cpu_notifier_register_done();
-	return 0;
+	return cpuhp_setup_state(CPUHP_AP_ARM64_DEBUG_MONITORS_STARTING,
+				 "CPUHP_AP_ARM64_DEBUG_MONITORS_STARTING",
+				 clear_os_lock, NULL);
 }
 postcore_initcall(debug_monitors_init);
 
@@ -435,8 +417,10 @@ NOKPROBE_SYMBOL(kernel_active_single_step);
 /* ptrace API */
 void user_enable_single_step(struct task_struct *task)
 {
-	set_ti_thread_flag(task_thread_info(task), TIF_SINGLESTEP);
-	set_regs_spsr_ss(task_pt_regs(task));
+	struct thread_info *ti = task_thread_info(task);
+
+	if (!test_and_set_ti_thread_flag(ti, TIF_SINGLESTEP))
+		set_regs_spsr_ss(task_pt_regs(task));
 }
 NOKPROBE_SYMBOL(user_enable_single_step);
 
