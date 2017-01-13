@@ -54,9 +54,9 @@ node.
 DMA
 ~~~
 - compatible: ti,am3359-cppi41
-- reg: offset and length of the following register spaces: USBSS, USB
+- reg: offset and length of the following register spaces: USB
   CPPI DMA Controller, USB CPPI DMA Scheduler, USB Queue Manager
-- reg-names: glue, controller, scheduler, queuemgr
+- reg-names: controller, scheduler, queuemgr
 - #dma-cells: should be set to 2. The first number represents the
   endpoint number (0 … 14 for endpoints 1 … 15 on instance 0 and 15 … 29
   for endpoints 1 … 15 on instance 1). The second number is 0 for RX and
@@ -183,11 +183,10 @@ usb: usb@47400000 {
 
 	cppi41dma: dma-controller@07402000 {
 		compatible = "ti,am3359-cppi41";
-		reg =  <0x47400000 0x1000
-			0x47402000 0x1000
+		reg =  <0x47402000 0x1000
 			0x47403000 0x1000
 			0x47404000 0x4000>;
-		reg-names = "glue", "controller", "scheduler", "queuemgr";
+		reg-names = "controller", "scheduler", "queuemgr";
 		interrupts = <17>;
 		interrupt-names = "glue";
 		#dma-cells = <2>;
